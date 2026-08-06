@@ -24,6 +24,8 @@ from models import (
     get_next_field_number,
     log_field_change,
     get_user_level_name,
+    update_user_by_id,
+    delete_user_by_id,
 )
 from web_helpers import (
     get_field_mappings,
@@ -48,6 +50,12 @@ LEVEL_CAN_CREATE = {
     0: [],
     1: [0],
     2: [0, 1, 2],
+}
+
+LEVEL_CAN_EDIT = {
+    0: [],
+    1: [0],
+    2: [0, 1],
 }
 
 
@@ -92,6 +100,16 @@ class AddUserRequest(BaseModel):
 
 class UpdateLevelRequest(BaseModel):
     level: UserLevel
+
+
+class EditUserRequest(BaseModel):
+    username: str = Field("", description="Leave empty to keep current username")
+    password: str = Field("", description="Leave empty to keep current password")
+
+
+class PatchUserRequest(BaseModel):
+    username: str = Field("", description="Leave empty to keep current username")
+    password: str = Field("", description="Leave empty to keep current password")
 
 
 app = FastAPI(title="DPL Data Bank API")
@@ -530,6 +548,128 @@ def update_user_level(user_id: int, body: UpdateLevelRequest,
     change_user_level_by_id(user_id, new_level)
 
     return {"message": f"User level updated to {get_user_level_name(new_level)}"}
+
+
+@app.patch("/api/users/{user_id}")
+def edit_user(user_id: int, body: PatchUserRequest,
+              current_user: dict = Depends(get_current_user)):
+    current_level = current_user["level"]
+    target_levels = LEVEL_CAN_EDIT.get(current_level, [])
+
+    conn = get_connection()
+    cursor = conn.cursor()
+
+    cursor.execute("SELECT user_level FROM users WHERE id=%s", (user_id,))
+    record = cursor.fetchone()
+    cursor.close()
+    conn.close()
+
+    if not record:
+        raise HTTPException(
+            status_code=status.HTTP_404_NOT_FOUND,
+            detail="User not found",
+        )
+
+    target_level = record[0]
+
+    if target_level not in target_levels:
+        raise HTTPException(
+            status_code=status.HTTP_403_FORBIDDEN,
+            detail=f"You cannot edit a {get_user_level_name(target_level)} user",
+        )
+
+    if user_id == current_user["id"]:
+        raise HTTPException(
+            status_code=status.HTTP_403_FORBIDDEN,
+            detail="You cannot edit your own account",
+        )
+
+    username = (body.username or "").strip()
+    password = (body.password or "").strip()
+
+    if not username and not password:
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail="Provide at least username or password to update",
+        )
+
+    kwargs = {}
+
+    if username:
+        if len(username) < 3:
+            raise HTTPException(
+                status_code=status.HTTP_400_BAD_REQUEST,
+                detail="Username must be at least 3 characters",
+            )
+        kwargs["username"] = username
+
+    if password:
+        if len(password) < 4:
+            raise HTTPException(
+                status_code=status.HTTP_400_BAD_REQUEST,
+                detail="Password must be at least 4 characters",
+            )
+        kwargs["password"] = password
+
+    success = update_user_by_id(user_id, **kwargs)
+
+    if success:
+        changes = []
+        if "username" in kwargs:
+            changes.append("username")
+        if "password" in kwargs:
+            changes.append("password")
+        return {"message": f"Updated {', '.join(changes)} successfully"}
+
+    raise HTTPException(
+        status_code=status.HTTP_400_BAD_REQUEST,
+        detail="Failed to update user",
+    )
+
+
+@app.delete("/api/users/{user_id}")
+def delete_user(user_id: int,
+                current_user: dict = Depends(get_current_user)):
+    current_level = current_user["level"]
+    target_levels = LEVEL_CAN_EDIT.get(current_level, [])
+
+    conn = get_connection()
+    cursor = conn.cursor()
+
+    cursor.execute("SELECT username, user_level FROM users WHERE id=%s", (user_id,))
+    record = cursor.fetchone()
+    cursor.close()
+    conn.close()
+
+    if not record:
+        raise HTTPException(
+            status_code=status.HTTP_404_NOT_FOUND,
+            detail="User not found",
+        )
+
+    target_username, target_level = record
+
+    if target_level not in target_levels:
+        raise HTTPException(
+            status_code=status.HTTP_403_FORBIDDEN,
+            detail=f"You cannot delete a {get_user_level_name(target_level)} user",
+        )
+
+    if user_id == current_user["id"]:
+        raise HTTPException(
+            status_code=status.HTTP_403_FORBIDDEN,
+            detail="You cannot delete your own account",
+        )
+
+    deleted = delete_user_by_id(user_id)
+
+    if deleted:
+        return {"message": f"User '{target_username}' deleted successfully"}
+
+    raise HTTPException(
+        status_code=status.HTTP_400_BAD_REQUEST,
+        detail="Failed to delete user",
+    )
 
 
 if __name__ == "__main__":

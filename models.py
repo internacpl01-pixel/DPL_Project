@@ -486,6 +486,74 @@ def change_user_level(username, new_level):
         f"\nUser '{username}' level changed to {get_user_level_name(new_level)}"
     )
 
+
+def update_user_by_id(user_id, username=None, password=None, new_level=None):
+
+    conn = get_connection()
+    cursor = conn.cursor()
+
+    sets = []
+    params = []
+
+    if username is not None:
+        sets.append("username=%s")
+        params.append(username)
+
+    if password is not None:
+        password_hash = bcrypt.hashpw(
+            password.encode("utf-8"),
+            bcrypt.gensalt()
+        ).decode("utf-8")
+        sets.append("password_hash=%s")
+        params.append(password_hash)
+
+    if new_level is not None:
+        sets.append("user_level=%s")
+        params.append(new_level)
+
+    if not sets:
+        cursor.close()
+        conn.close()
+        return False
+
+    params.append(user_id)
+
+    cursor.execute(
+        f"""
+        UPDATE users
+        SET {', '.join(sets)}
+        WHERE id=%s
+        """,
+        tuple(params),
+    )
+
+    conn.commit()
+
+    cursor.close()
+    conn.close()
+
+    return True
+
+
+def delete_user_by_id(user_id):
+
+    conn = get_connection()
+    cursor = conn.cursor()
+
+    cursor.execute(
+        "DELETE FROM users WHERE id=%s",
+        (user_id,),
+    )
+
+    conn.commit()
+
+    deleted = cursor.rowcount > 0
+
+    cursor.close()
+    conn.close()
+
+    return deleted
+
 def register_user(username, password, user_level=0):
 
     conn = get_connection()
