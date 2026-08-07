@@ -338,23 +338,42 @@ def update_mapping(fieldname: str, body: UpdateMappingRequest,
         displayname = existing_displayname
 
     if mapfields:
-        existing_items = [
-            item.strip()
-            for item in existing_mapfields.split(",")
-            if item.strip()
-        ]
         new_items = [
             item.strip()
             for item in mapfields.split(",")
             if item.strip()
         ]
-        duplicates = [item for item in new_items if item in existing_items]
-        if duplicates:
+        # Check duplicates within same row
+        existing_items = [
+            item.strip()
+            for item in existing_mapfields.split(",")
+            if item.strip()
+        ]
+        duplicates_in_row = [item for item in new_items if item in existing_items]
+        if duplicates_in_row:
             cursor.close()
             conn.close()
             raise HTTPException(
                 status_code=status.HTTP_400_BAD_REQUEST,
-                detail=f"Duplicate values: {', '.join(duplicates)}",
+                detail=f"Duplicate values in same row: {', '.join(duplicates_in_row)}",
+            )
+        # Check duplicates across OTHER rows
+        all_mappings = get_field_mappings()
+        all_values_in_other_rows = set()
+        for m in all_mappings:
+            if m["fieldname"] == fieldname:
+                continue
+            for v in m["mapfields"].split(","):
+                v = v.strip()
+                if v:
+                    all_values_in_other_rows.add(v.lower())
+        duplicates_across = [item for item in new_items if item.lower() in all_values_in_other_rows]
+        if duplicates_across:
+            cursor.close()
+            conn.close()
+            raise HTTPException(
+                status_code=status.HTTP_400_BAD_REQUEST,
+                detail=f"Values already exist in another mapping: {', '.join(duplicates_across)}",
             )
         mapfields = existing_mapfields + ", " + ", ".join(new_items)
     else:
