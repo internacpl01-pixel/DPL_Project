@@ -289,12 +289,10 @@ def register(body: RegisterRequest):
 @app.get("/api/me")
 def get_me(current_user: dict = Depends(get_current_user)):
     return {
-        "user": {
-            "id": current_user["id"],
-            "username": current_user["username"],
-            "level": current_user["level"],
-            "level_name": get_user_level_name(current_user["level"]),
-        }
+        "id": current_user["id"],
+        "username": current_user["username"],
+        "level": current_user["level"],
+        "level_name": get_user_level_name(current_user["level"]),
     }
 
 
