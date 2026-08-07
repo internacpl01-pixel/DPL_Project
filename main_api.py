@@ -287,7 +287,7 @@ def register(body: RegisterRequest):
 
 
 @app.get("/api/me")
-def get_me(current_user: dict = Depends(get_current_user)):
+async def get_me(current_user: dict = Depends(get_current_user)):
     return {
         "id": current_user["id"],
         "username": current_user["username"],
@@ -297,12 +297,12 @@ def get_me(current_user: dict = Depends(get_current_user)):
 
 
 @app.post("/api/logout")
-def logout():
+async def logout():
     return {"message": "Logged out"}
 
 
 @app.get("/api/field-mappings")
-def list_field_mappings(current_user: dict = Depends(get_current_user)):
+async def list_field_mappings(current_user: dict = Depends(get_current_user)):
     return get_field_mappings()
 
 
