@@ -389,7 +389,7 @@ async def delete_mapfield(fieldname: str, request: Request,
     cursor = conn.cursor()
 
     cursor.execute(
-        "SELECT id, mapfields FROM fieldmap WHERE fieldname=%s",
+        "SELECT id, displayname, mapfields FROM fieldmap WHERE fieldname=%s",
         (fieldname,),
     )
     record = cursor.fetchone()
@@ -402,7 +402,7 @@ async def delete_mapfield(fieldname: str, request: Request,
             detail="Field not found",
         )
 
-    record_id, existing_mapfields = record
+    record_id, existing_displayname, existing_mapfields = record
 
     items = [item.strip() for item in existing_mapfields.split(",") if item.strip()]
 
