@@ -481,6 +481,13 @@ def create_custom_field(body: CustomFieldRequest,
     cursor.execute(
         f"ALTER TABLE master ADD COLUMN IF NOT EXISTS {col_name} {sql_type}",
     )
+
+    # Auto-create field mapping with fieldname as displayname and mapfields
+    cursor.execute(
+        "INSERT INTO fieldmap (fieldname, displayname, mapfields) VALUES (%s, %s, %s) ON CONFLICT (fieldname) DO UPDATE SET displayname=EXCLUDED.displayname, mapfields=EXCLUDED.mapfields",
+        (col_name, col_name, col_name),
+    )
+
     conn.commit()
     cursor.close()
     conn.close()
