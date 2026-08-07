@@ -40,106 +40,16 @@ def create_tables():
     )
 
 
-    # Master Table
+    # Master Table — only id, custom fields added dynamically
 
     cursor.execute(
         """
         CREATE TABLE IF NOT EXISTS master
         (
-            id SERIAL PRIMARY KEY,
-            date DATE,
-            "desc" TEXT,
-            withdrawal REAL,
-            deposits REAL,
-            balance REAL,
-            field_date_1 DATE,
-            field_date_2 DATE,
-            field_date_3 DATE,
-            field_date_4 DATE,
-            field_date_5 DATE,
-            field_num_1 REAL,
-            field_num_2 REAL,
-            field_num_3 REAL,
-            field_num_4 REAL,
-            field_num_5 REAL,
-            field_num_6 REAL,
-            field_num_7 REAL,
-            field_num_8 REAL,
-            field_num_9 REAL,
-            field_num_10 REAL,
-            field_text_1 TEXT,
-            field_text_2 TEXT,
-            field_text_3 TEXT,
-            field_text_4 TEXT,
-            field_text_5 TEXT,
-            field_text_6 TEXT,
-            field_text_7 TEXT,
-            field_text_8 TEXT,
-            field_text_9 TEXT,
-            field_text_10 TEXT,
-            field_text_11 TEXT,
-            field_text_12 TEXT,
-            field_text_13 TEXT,
-            field_text_14 TEXT,
-            field_text_15 TEXT,
-            field_text_16 TEXT,
-            field_text_17 TEXT,
-            field_text_18 TEXT,
-            field_text_19 TEXT,
-            field_text_20 TEXT
+            id SERIAL PRIMARY KEY
         )
         """
     )
-
-
-    # Add new columns to master table if they don't already exist (for existing databases)
-
-    new_columns = [
-        ("field_date_1", "DATE"),
-        ("field_date_2", "DATE"),
-        ("field_date_3", "DATE"),
-        ("field_date_4", "DATE"),
-        ("field_date_5", "DATE"),
-        ("field_num_1", "REAL"),
-        ("field_num_2", "REAL"),
-        ("field_num_3", "REAL"),
-        ("field_num_4", "REAL"),
-        ("field_num_5", "REAL"),
-        ("field_num_6", "REAL"),
-        ("field_num_7", "REAL"),
-        ("field_num_8", "REAL"),
-        ("field_num_9", "REAL"),
-        ("field_num_10", "REAL"),
-        ("field_text_1", "TEXT"),
-        ("field_text_2", "TEXT"),
-        ("field_text_3", "TEXT"),
-        ("field_text_4", "TEXT"),
-        ("field_text_5", "TEXT"),
-        ("field_text_6", "TEXT"),
-        ("field_text_7", "TEXT"),
-        ("field_text_8", "TEXT"),
-        ("field_text_9", "TEXT"),
-        ("field_text_10", "TEXT"),
-        ("field_text_11", "TEXT"),
-        ("field_text_12", "TEXT"),
-        ("field_text_13", "TEXT"),
-        ("field_text_14", "TEXT"),
-        ("field_text_15", "TEXT"),
-        ("field_text_16", "TEXT"),
-        ("field_text_17", "TEXT"),
-        ("field_text_18", "TEXT"),
-        ("field_text_19", "TEXT"),
-        ("field_text_20", "TEXT"),
-    ]
-
-    for col_name, col_type in new_columns:
-
-        cursor.execute(
-            f"""
-            ALTER TABLE master
-            ADD COLUMN IF NOT EXISTS {col_name} {col_type}
-            """
-        )
 
 
     conn.commit()
@@ -155,89 +65,8 @@ def create_tables():
 
 def insert_default_mappings():
 
-    conn = get_connection()
-    cursor = conn.cursor()
-
-
-    default_fields = [
-
-        (
-            "date",
-            "Date",
-            "Date, Transaction Date, Value Date, Entry Date, Tran Date"
-        ),
-
-        (
-            "desc",
-            "Particulars",
-            "desc, description, particulars, narration, remarks"
-        ),
-
-        (
-            "withdrawal",
-            "Withdrawal",
-            "withdrawal, withdrawals"
-        ),
-
-        (
-            "deposits",
-            "Deposits",
-            "deposit, deposits"
-        ),
-
-        (
-            "balance",
-            "Balance",
-            "balance"
-        )
-    ]
-
-
-
-    for field in default_fields:
-
-
-        cursor.execute(
-            """
-            SELECT *
-            FROM fieldmap
-            WHERE fieldname=%s
-            """,
-            (field[0],)
-        )
-
-
-        exists = cursor.fetchone()
-
-
-
-        if not exists:
-
-            cursor.execute(
-                """
-                INSERT INTO fieldmap
-                (
-                    fieldname,
-                    displayname,
-                    mapfields
-                )
-
-                VALUES
-                (%s,%s,%s)
-
-                """,
-                field
-            )
-
-
-
-    conn.commit()
-
-    cursor.close()
-    conn.close()
-
-
-    print("Default field mappings inserted")
+    # No defaults — all fields are added dynamically via Add Custom Field
+    print("Default field mappings skipped (custom fields only)")
 
 
 
