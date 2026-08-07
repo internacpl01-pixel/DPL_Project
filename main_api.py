@@ -315,6 +315,7 @@ def update_mapping(fieldname: str, body: UpdateMappingRequest,
     conn = get_connection()
     cursor = conn.cursor()
 
+    # Check if fieldname already exists — if not, create it (upsert)
     cursor.execute(
         "SELECT id, displayname, mapfields FROM fieldmap WHERE fieldname=%s",
         (fieldname,),
@@ -322,13 +323,14 @@ def update_mapping(fieldname: str, body: UpdateMappingRequest,
     record = cursor.fetchone()
 
     if not record:
-        cursor.close()
-        conn.close()
-        raise HTTPException(
-            status_code=status.HTTP_404_NOT_FOUND,
-            detail="Field not found",
+        # Auto-create the mapping if it doesn't exist
+        new_displayname = displayname.strip() if displayname.strip() else fieldname
+        cursor.execute(
+            "INSERT INTO fieldmap (fieldname, displayname, mapfields) VALUES (%s, %s, %s)",
+            (fieldname, new_displayname, ""),
         )
-
+        conn.commit()
+        record = (cursor.lastrowid, new_displayname, "")
     record_id, existing_displayname, existing_mapfields = record
 
     # If displayname is empty, keep the existing value from DB
