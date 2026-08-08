@@ -14,7 +14,14 @@ async def process_pdf_import(file_bytes: bytes, save: bool = False):
 
     loop = asyncio.get_running_loop()
     t0 = time.perf_counter()
-    result = await loop.run_in_executor(None, _parse_sync, file_bytes)
+    try:
+        result = await asyncio.wait_for(
+            loop.run_in_executor(None, _parse_sync, file_bytes),
+            timeout=60.0,
+        )
+    except asyncio.TimeoutError:
+        logger.error("[PDF] Parser timed out after 60s")
+        raise RuntimeError("PDF parsing timed out (>60s). The PDF may be too complex or the OCR fallback is slow.")
     t_parse = (time.perf_counter() - t0) * 1000
 
     rows = result.get("rows", [])
