@@ -51,6 +51,20 @@ def create_tables():
         """
     )
 
+    # Ensure id column exists — older databases may have a master table
+    # without an id column if the table was created before the schema was finalized.
+    cursor.execute(
+        """
+        SELECT 1 FROM information_schema.columns
+        WHERE table_name='master' AND column_name='id'
+        """
+    )
+    if cursor.fetchone() is None:
+        cursor.execute(
+            "ALTER TABLE master ADD COLUMN id SERIAL PRIMARY KEY"
+        )
+        print("Added missing 'id' column to master table")
+
 
     conn.commit()
 
