@@ -1,6 +1,6 @@
 """PDF import router."""
-from fastapi import APIRouter, Depends, File, Form, UploadFile, HTTPException, status
 import logging
+from fastapi import APIRouter, Depends, File, Form, UploadFile, HTTPException, status
 
 from dependencies import get_current_user
 from services.pdf_import import process_pdf_import
@@ -15,6 +15,7 @@ async def import_pdf(
     save: bool = Form(False),
     current_user: dict = Depends(get_current_user),
 ):
+    logger.info("[Import] Request received, file=%s, save=%s", file.filename, save)
     if not file or not file.filename:
         raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail="No file provided")
 
