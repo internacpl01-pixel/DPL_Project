@@ -9,7 +9,7 @@ load_dotenv()
 
 DATABASE_URL = os.getenv("DATABASE_URL", "")
 
-print(f"Loaded DATABASE_URL: {DATABASE_URL}")  # debug
+
 
 DB_NAME = os.getenv("DB_NAME", "dpl_database")
 DB_USER = os.getenv("DB_USER", "postgres")
