@@ -153,7 +153,7 @@ def build_master_insert(fields_map: dict, row_data: dict) -> tuple:
     return cols_str, placeholders, tuple(values)
 
 
-def append_rows_to_master(conn, rows: list, fieldmap_rows: list) -> int:
+async def append_rows_to_master(conn, rows: list, fieldmap_rows: list) -> int:
     """
     Append normalized rows to the master table.
     No duplicate checks, no upsert, no delete-before-import.
@@ -194,40 +194,50 @@ def append_rows_to_master(conn, rows: list, fieldmap_rows: list) -> int:
         else:
             resolved_fields[parser_key] = fieldname
 
-    cursor = conn.cursor()
     inserted = 0
+
+    # Collect all row data and compute the union of columns
+    all_rows = []
+    cols_set = set()
 
     for row in rows:
         columns = []
         values = []
-
         for parser_key, master_col in resolved_fields.items():
             val = row.get(parser_key, "")
-            # Only include if the column actually exists in master
             if master_col and val:
                 columns.append(master_col)
                 values.append(val)
-
         if not columns:
             continue
+        cols_set.update(columns)
+        all_rows.append((columns, values))
 
-        cols_str = ", ".join(
-            f'"{c}"' if c == 'desc' else c for c in columns
+    if not all_rows:
+        return 0
+
+    cols_list = sorted(cols_set)
+    col_indices = {c: i for i, c in enumerate(cols_list)}
+    cols_str = ", ".join(f'"{c}"' if c == 'desc' else c for c in cols_list)
+
+    flat_values = []
+    for columns, values in all_rows:
+        row_vals = [None] * len(cols_list)
+        for i, col in enumerate(columns):
+            row_vals[col_indices[col]] = values[i]
+        flat_values.extend(row_vals)
+
+    try:
+        placeholders_sql = ", ".join(
+            ["(" + ", ".join([f"${i+1}" for i in range(len(cols_list))]) + ")"] * len(all_rows)
         )
-        placeholders = ", ".join(["%s"] * len(values))
-
-        try:
-            cursor.execute(
-                f"INSERT INTO master ({cols_str}) VALUES ({placeholders})",
-                tuple(values),
-            )
-            inserted += 1
-        except Exception as e:
-            logger.warning(f"Failed to insert row: {row}, error: {e}")
-            # Skip this row, continue with others
-
-    conn.commit()
-    cursor.close()
+        await conn.execute(
+            f"INSERT INTO master ({cols_str}) VALUES {placeholders_sql}",
+            *flat_values,
+        )
+        inserted = len(all_rows)
+    except Exception as e:
+        logger.error(f"Bulk insert failed: {e}")
 
     logger.info(f"Inserted {inserted}/{len(rows)} rows into master")
     return inserted
