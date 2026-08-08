@@ -24,7 +24,7 @@ class Database:
     @classmethod
     async def connect(cls):
         dsn = await _get_dsn()
-        cls.pool = await asyncpg.create_pool(dsn, min_size=2, max_size=10)
+        cls.pool = await asyncpg.create_pool(dsn, min_size=2, max_size=10, statement_cache_size=0)
 
     @classmethod
     async def disconnect(cls):
