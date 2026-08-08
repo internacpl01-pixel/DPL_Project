@@ -1,0 +1,16 @@
+name: Keep Render Alive
+
+on:
+  schedule:
+    # Every 10 minutes — Render free tier sleeps after 15 min idle
+    - cron: "*/10 * * * *"
+  workflow_dispatch:
+
+jobs:
+  ping:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Ping backend health endpoint
+        run: |
+          curl -s -o /dev/null -w "Health: %{http_code} in %{time_total}s\n" \
+            https://dpl-project.onrender.com/api/health
