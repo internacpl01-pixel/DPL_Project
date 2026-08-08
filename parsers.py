@@ -6,6 +6,7 @@ Detects the bank and extracts normalized transaction rows.
 import io
 import re
 import logging
+import time
 
 logger = logging.getLogger(__name__)
 
@@ -725,6 +726,8 @@ def parse_pdf(file_bytes: bytes) -> dict:
             "pdfplumber is not installed. Add it to requirements.txt."
         )
 
+    t0 = time.perf_counter()
+
     # Extract text
     text = ""
     use_ocr = False
@@ -734,6 +737,9 @@ def parse_pdf(file_bytes: bytes) -> dict:
     except Exception as e:
         logger.warning(f"pdfplumber extraction failed: {e}")
         use_ocr = True
+
+    t1 = time.perf_counter()
+    logger.info(f"[Parser] text extraction: {(t1-t0)*1000:.0f}ms, chars={len(text)}")
 
     if not has_sufficient_text(text):
         logger.info("Insufficient text extracted, attempting OCR...")
@@ -747,6 +753,9 @@ def parse_pdf(file_bytes: bytes) -> dict:
                 f"Could not extract text from PDF via pdfplumber or OCR: {e}"
             )
 
+    t2 = time.perf_counter()
+    logger.info(f"[Parser] after OCR (if needed): {(t2-t1)*1000:.0f}ms, chars={len(text)}")
+
     if not text.strip():
         raise RuntimeError(
             "PDF appears to be empty or could not be read. "
@@ -756,6 +765,9 @@ def parse_pdf(file_bytes: bytes) -> dict:
     # Detect bank
     bank = detect_bank(text)
 
+    t3 = time.perf_counter()
+    logger.info(f"[Parser] bank detection: {(t3-t2)*1000:.0f}ms, bank={bank}")
+
     # Select parser
     parser_fn = _PARSERS.get(bank, _parse_generic)
 
@@ -763,12 +775,17 @@ def parse_pdf(file_bytes: bytes) -> dict:
         rows = parser_fn(text)
     except Exception as e:
         logger.error(f"Parser for {bank} failed: {e}", exc_info=True)
-        # Fall back to generic parser
         rows = _parse_generic(text)
         bank = BANK_UNKNOWN
 
+    t4 = time.perf_counter()
+    logger.info(f"[Parser] row extraction: {(t4-t3)*1000:.0f}ms, rows={len(rows)}")
+
     # Normalize every row
     rows = [_normalize_row(r) for r in rows]
+
+    t5 = time.perf_counter()
+    logger.info(f"[Parser] normalization: {(t5-t4)*1000:.0f}ms, TOTAL parse: {(t5-t0)*1000:.0f}ms")
 
     return {
         "bank": bank,
