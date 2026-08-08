@@ -30,8 +30,24 @@ def get_master_columns() -> list:
     return list(_MASTER_COLUMNS)
 
 
-def get_live_columns(conn) -> list:
+# Cache live columns — invalidated by TTL since the schema changes only when
+# a custom field is added. Avoids hitting information_schema on every page load.
+_LIVE_COLS_CACHE = {"cols": None, "expires_at": 0}
+_LIVE_COLS_TTL = 30  # seconds
+
+
+def get_live_columns(conn=None) -> list:
     """Query information_schema for columns that actually exist in master right now."""
+    import time
+    from db import get_connection
+
+    now = time.time()
+    if _LIVE_COLS_CACHE["cols"] is not None and now < _LIVE_COLS_CACHE["expires_at"]:
+        return _LIVE_COLS_CACHE["cols"]
+
+    owns_conn = conn is None
+    if owns_conn:
+        conn = get_connection()
     cursor = conn.cursor()
     cursor.execute("""
         SELECT column_name, data_type, is_nullable
@@ -41,7 +57,18 @@ def get_live_columns(conn) -> list:
     """)
     cols = [{"name": r[0], "type": r[1], "nullable": r[2]} for r in cursor.fetchall()]
     cursor.close()
+    if owns_conn:
+        conn.close()
+
+    _LIVE_COLS_CACHE["cols"] = cols
+    _LIVE_COLS_CACHE["expires_at"] = now + _LIVE_COLS_TTL
     return cols
+
+
+def invalidate_live_columns_cache():
+    """Call this after adding/removing custom fields."""
+    _LIVE_COLS_CACHE["cols"] = None
+    _LIVE_COLS_CACHE["expires_at"] = 0
 
 
 def get_master_rows(limit: int = 50, offset: int = 0) -> dict:

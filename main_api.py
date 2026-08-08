@@ -5,7 +5,8 @@ from fastapi.responses import FileResponse, JSONResponse
 from fastapi.staticfiles import StaticFiles
 
 from jose import JWTError, jwt
-from datetime import datetime, timedelta
+from datetime import datetime, timedelta, timezone
+import time as _time
 from pydantic import BaseModel, Field
 import sys
 import os
@@ -140,7 +141,7 @@ if os.path.isdir(FRONTEND_DIR):
 
 def create_access_token(data: dict):
     to_encode = data.copy()
-    expire = datetime.utcnow() + timedelta(minutes=ACCESS_TOKEN_EXPIRE_MINUTES)
+    expire = datetime.now(timezone.utc) + timedelta(minutes=ACCESS_TOKEN_EXPIRE_MINUTES)
     to_encode.update({"exp": expire})
     return jwt.encode(to_encode, SECRET_KEY, algorithm=ALGORITHM)
 
@@ -195,6 +196,12 @@ def serve_index():
     if os.path.exists(index):
         return FileResponse(index)
     return {"message": "DPL Data Bank API is running."}
+
+
+@app.get("/api/health", include_in_schema=False)
+def health_check():
+    """Lightweight health check — no DB hit, for monitoring/keepalive."""
+    return {"status": "ok", "timestamp": datetime.now(timezone.utc).isoformat()}
 
 
 @app.get("/frontend/", include_in_schema=False)
@@ -721,8 +728,10 @@ def list_data(page: int = 1, limit: int = 50,
     limit = max(1, min(500, limit))
     offset = (page - 1) * limit
     try:
+        t0 = _time.time()
         result = get_master_rows(limit=limit, offset=offset)
-        logger.info(f"GET /api/data: page={page}, limit={limit}, rows={len(result.get('rows', []))}, total={result.get('total', 0)}, cols={len(result.get('columns', []))}")
+        ms = (_time.time() - t0) * 1000
+        logger.info(f"GET /api/data: page={page}, limit={limit}, rows={len(result.get('rows', []))}, total={result.get('total', 0)}, cols={len(result.get('columns', []))}, time={ms:.0f}ms")
         return result
     except Exception as e:
         logger.error(f"GET /api/data FAILED: {type(e).__name__}: {e}")
@@ -810,6 +819,7 @@ async def import_pdf(file: UploadFile = File(...),
     # Lazy-import the parser so it doesn't load on every cold start
     from parsers import parse_pdf
 
+    t0 = _time.time()
     try:
         result = parse_pdf(file_bytes)
     except RuntimeError as e:
@@ -824,16 +834,20 @@ async def import_pdf(file: UploadFile = File(...),
             status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
             detail=f"Failed to parse PDF: {e}",
         )
+    parse_ms = (_time.time() - t0) * 1000
 
     rows = result.get("rows", [])
     bank = result.get("bank", "Unknown")
 
     inserted_count = 0
+    save_ms = 0
     if save and rows:
         try:
             conn = get_connection()
             fieldmap_rows = get_field_mappings()
+            t1 = _time.time()
             inserted_count = append_rows_to_master(conn, rows, fieldmap_rows)
+            save_ms = (_time.time() - t1) * 1000
             conn.close()
         except Exception as e:
             logger.exception("Failed to save imported rows")
@@ -841,6 +855,13 @@ async def import_pdf(file: UploadFile = File(...),
                 status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
                 detail=f"Parsed but failed to save: {e}",
             )
+
+    total_ms = (_time.time() - t0) * 1000
+    logger.info(
+        f"PDF upload: {len(file_bytes)/1024:.1f}KB, parse={parse_ms:.0f}ms, "
+        f"save={save_ms:.0f}ms, rows={len(rows)}, inserted={inserted_count}, "
+        f"bank={bank}, total={total_ms:.0f}ms"
+    )
 
     return {
         "bank": bank,
