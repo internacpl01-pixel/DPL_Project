@@ -171,28 +171,9 @@ async def append_rows_to_master(conn, rows: list, fieldmap_rows: list) -> int:
 
     alias_map = resolve_field_map(fieldmap_rows)
 
-    # Build field mapping from row keys
-    # The parser always returns: date, description, withdrawal, deposits, balance, reference_no
-    parser_keys_to_canonical = {
-        "date": "date",
-        "description": "desc",
-        "withdrawal": "withdrawal",
-        "deposits": "deposits",
-        "balance": "balance",
-        "reference_no": "reference_no",
-    }
-
-    # Resolve each canonical through fieldmap (in case the parser key matches an alias)
-    resolved_fields = {}
-    for parser_key, canon in parser_keys_to_canonical.items():
-        # Check if the parser key itself matches a fieldmap alias
-        fieldname = resolve_column(parser_key, alias_map)
-        if fieldname == parser_key or fieldname in {
-            "date", "desc", "withdrawal", "deposits", "balance", "reference_no"
-        }:
-            resolved_fields[parser_key] = canon
-        else:
-            resolved_fields[parser_key] = fieldname
+    # Map parser keys → master columns via fieldmap
+    parser_keys = ["date", "description", "withdrawal", "deposits", "balance"]
+    resolved_fields = {pk: resolve_column(pk, alias_map) for pk in parser_keys}
 
     inserted = 0
 
@@ -200,12 +181,20 @@ async def append_rows_to_master(conn, rows: list, fieldmap_rows: list) -> int:
     all_rows = []
     cols_set = set()
 
+    # Gather live column names from the database
+    live_col_rows = await conn.fetch(
+        "SELECT column_name FROM information_schema.columns WHERE table_name='master'"
+    )
+    live_col_names = {r["column_name"] for r in live_col_rows}
+
     for row in rows:
         columns = []
         values = []
         for parser_key, master_col in resolved_fields.items():
+            if not master_col or master_col not in live_col_names:
+                continue
             val = row.get(parser_key, "")
-            if master_col and val:
+            if val != "" and val is not None:
                 columns.append(master_col)
                 values.append(val)
         if not columns:

@@ -4,7 +4,7 @@ import logging
 from pathlib import Path
 from contextlib import asynccontextmanager
 
-from fastapi import FastAPI, Request
+from fastapi import FastAPI, Request, HTTPException
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import FileResponse
 from fastapi.staticfiles import StaticFiles
@@ -35,7 +35,7 @@ app = FastAPI(title="DPL Data Bank API", lifespan=lifespan)
 
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=["*"],
+    allow_origins=["http://localhost:3000", "http://localhost:5173", "http://localhost:5000"],
     allow_credentials=True,
     allow_methods=["*"],
     allow_headers=["Authorization", "Content-Type"],
@@ -76,7 +76,11 @@ async def serve_frontend_index():
 
 @app.get("/frontend/{path:path}", include_in_schema=False)
 async def serve_frontend_assets(path: str):
-    file_path = FRONTEND_DIR / path
+    file_path = (FRONTEND_DIR / path).resolve()
+    try:
+        file_path.relative_to(FRONTEND_DIR.resolve())
+    except ValueError:
+        raise HTTPException(status_code=404, detail="Not found")
     if file_path.is_file():
         return FileResponse(str(file_path))
     index = FRONTEND_DIR / "index.html"

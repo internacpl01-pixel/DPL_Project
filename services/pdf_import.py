@@ -17,11 +17,11 @@ async def process_pdf_import(file_bytes: bytes, save: bool = False):
     try:
         result = await asyncio.wait_for(
             loop.run_in_executor(None, _parse_sync, file_bytes),
-            timeout=60.0,
+            timeout=180.0,
         )
     except asyncio.TimeoutError:
-        logger.error("[PDF] Parser timed out after 60s")
-        raise RuntimeError("PDF parsing timed out (>60s). The PDF may be too complex or the OCR fallback is slow.")
+        logger.error("[PDF] Parser timed out after 180s")
+        raise RuntimeError("PDF parsing timed out (>180s). Try a smaller file or ensure it's a text-based PDF (not scanned).")
     t_parse = (time.perf_counter() - t0) * 1000
 
     rows = result.get("rows", [])
@@ -31,16 +31,13 @@ async def process_pdf_import(file_bytes: bytes, save: bool = False):
     inserted_count = 0
     if save and rows:
         t1 = time.perf_counter()
-        conn = await Database.acquire()
-        try:
+        async with Database.acquire() as conn:
             fieldmap_rows = await get_field_mappings()
             t_fm = (time.perf_counter() - t1) * 1000
             t2 = time.perf_counter()
             inserted_count = await append_rows_to_master(conn, rows, fieldmap_rows)
             t_ins = (time.perf_counter() - t2) * 1000
             logger.info(f"[PDF] fieldmap: {t_fm:.0f}ms, insert: {t_ins:.0f}ms, count={inserted_count}")
-        finally:
-            await conn.close()
 
     t_total = (time.perf_counter() - t_start) * 1000
     logger.info(f"[PDF] TOTAL: {t_total:.0f}ms")

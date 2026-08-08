@@ -9,7 +9,9 @@ from database import Database
 oauth2_scheme = OAuth2PasswordBearer(tokenUrl="/api/login")
 bearer_scheme = HTTPBearer(auto_error=False)
 
-SECRET_KEY = os.environ.get("SECRET_KEY", "dpl-secret-key-change-in-production")
+SECRET_KEY = os.environ.get("SECRET_KEY")
+if not SECRET_KEY:
+    raise RuntimeError("SECRET_KEY environment variable is required")
 ALGORITHM = "HS256"
 ACCESS_TOKEN_EXPIRE_MINUTES = 480
 

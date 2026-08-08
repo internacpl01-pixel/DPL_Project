@@ -4,8 +4,7 @@ from database import Database
 
 
 async def create_tables():
-    conn = await Database.acquire()
-    try:
+    async with Database.acquire() as conn:
         await conn.execute("""
             CREATE TABLE IF NOT EXISTS fieldmap (
                 id SERIAL PRIMARY KEY,
@@ -37,7 +36,6 @@ async def create_tables():
                 created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
             )
         """)
-        # Ensure standard master columns exist
         for col, sql_type in [("date", "DATE"), ("desc", "TEXT"), ("withdrawal", "REAL"), ("deposits", "REAL"), ("balance", "REAL")]:
             has_col = await conn.fetchval(
                 "SELECT 1 FROM information_schema.columns WHERE table_name=$1 AND column_name=$2",
@@ -46,14 +44,12 @@ async def create_tables():
             if not has_col:
                 qcol = f'"{col}"' if col == 'desc' else col
                 await conn.execute(f"ALTER TABLE master ADD COLUMN IF NOT EXISTS {qcol} {sql_type}")
-        # Ensure id column on master for older databases
         has_id = await conn.fetchval(
             "SELECT 1 FROM information_schema.columns WHERE table_name=$1 AND column_name=$2",
             "master", "id",
         )
         if not has_id:
             await conn.execute("ALTER TABLE master ADD COLUMN id SERIAL PRIMARY KEY")
-        # Ensure indexes exist
         if not await conn.fetchval(
             "SELECT 1 FROM pg_indexes WHERE tablename=$1 AND indexname=$2",
             "master", "idx_master_id",
@@ -66,12 +62,22 @@ async def create_tables():
             await conn.execute(
                 "CREATE INDEX idx_fieldchange_log_changed_at ON fieldchange_log(changed_at DESC)"
             )
-    finally:
-        await conn.close()
 
 
 async def insert_default_mappings():
-    pass  # No defaults — all fields added dynamically
+    defaults = [
+        ("date",        "Date",             "date,txn_date,value_date,transaction date"),
+        ("desc",        "Description",      "description,narration,particulars,remarks"),
+        ("withdrawal",  "Withdrawal",       "withdrawal,debit,dr,amount_out"),
+        ("deposits",    "Deposits",         "deposits,credit,cr,amount_in"),
+        ("balance",     "Balance",          "balance,closing_balance,available_balance"),
+    ]
+    for fieldname, displayname, mapfields in defaults:
+        await Database.execute(
+            "INSERT INTO fieldmap (fieldname, displayname, mapfields) VALUES ($1, $2, $3) "
+            "ON CONFLICT (fieldname) DO NOTHING",
+            fieldname, displayname, mapfields,
+        )
 
 
 async def create_default_admin():

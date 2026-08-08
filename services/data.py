@@ -4,8 +4,12 @@ import time as _time
 import asyncpg
 from datetime import date as _date
 from database import Database
+from import_helpers import resolve_field_map, resolve_column
+from services.mappings import get_field_mappings
 
 logger = logging.getLogger(__name__)
+
+_PARSER_KEYS = ("date", "description", "withdrawal", "deposits", "balance")
 
 _MASTER_COLUMNS = [
     "date", "desc", "withdrawal", "deposits", "balance",
@@ -83,14 +87,12 @@ async def insert_master_row(conn, row_data: dict) -> int:
     live_cols = await get_live_columns()
     available_cols = {c["name"]: c["type"] for c in live_cols}
 
-    key_to_col = {
-        "date": "date",
-        "description": "desc",
-        "withdrawal": "withdrawal",
-        "deposits": "deposits",
-        "balance": "balance",
-        "reference_no": None,
-    }
+    alias_map = resolve_field_map(await get_field_mappings())
+
+    key_to_col = {}
+    for pk in _PARSER_KEYS:
+        resolved = resolve_column(pk, alias_map)
+        key_to_col[pk] = resolved
 
     columns, values = [], []
     for key, col_name in key_to_col.items():
@@ -138,14 +140,12 @@ async def insert_master_rows_bulk(conn, rows: list) -> int:
     live_cols = await get_live_columns()
     available_cols = {c["name"]: c["type"] for c in live_cols}
 
-    key_to_col = {
-        "date": "date",
-        "description": "desc",
-        "withdrawal": "withdrawal",
-        "deposits": "deposits",
-        "balance": "balance",
-        "reference_no": None,
-    }
+    alias_map = resolve_field_map(await get_field_mappings())
+
+    key_to_col = {}
+    for pk in _PARSER_KEYS:
+        resolved = resolve_column(pk, alias_map)
+        key_to_col[pk] = resolved
 
     cols_set = set()
     row_templates = []
