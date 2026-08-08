@@ -1,7 +1,7 @@
-from fastapi import FastAPI, Depends, HTTPException, status, Request
+from fastapi import FastAPI, Depends, HTTPException, status, Request, Form, File, UploadFile
 from fastapi.security import OAuth2PasswordBearer, OAuth2PasswordRequestForm, HTTPBearer, HTTPAuthorizationCredentials
 from fastapi.middleware.cors import CORSMiddleware
-from fastapi.responses import FileResponse
+from fastapi.responses import FileResponse, JSONResponse
 from fastapi.staticfiles import StaticFiles
 
 from jose import JWTError, jwt
@@ -9,7 +9,10 @@ from datetime import datetime, timedelta
 from pydantic import BaseModel, Field
 import sys
 import os
+import logging
 from enum import Enum
+
+logger = logging.getLogger(__name__)
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 
@@ -35,6 +38,12 @@ from web_helpers import (
     update_field_mapping,
     change_user_level_by_id,
 )
+from data_api import (
+    get_master_rows,
+    insert_master_row,
+    delete_master_row,
+)
+from import_helpers import append_rows_to_master, normalize_headers, resolve_field_map
 
 
 SECRET_KEY = os.environ.get("SECRET_KEY", "dpl-secret-key-change-in-production")
@@ -696,6 +705,143 @@ def delete_user(user_id: int,
         status_code=status.HTTP_400_BAD_REQUEST,
         detail="Failed to delete user",
     )
+
+
+# ── Master Data CRUD ────────────────────────────────────────────────────────
+
+class AddDataRequest(BaseModel):
+    rows: list = Field(..., description="List of row dicts to insert")
+
+
+@app.get("/api/data")
+def list_data(page: int = 1, limit: int = 50,
+              current_user: dict = Depends(get_current_user)):
+    """List master data rows with pagination."""
+    page = max(1, page)
+    limit = max(1, min(500, limit))
+    offset = (page - 1) * limit
+    return get_master_rows(limit=limit, offset=offset)
+
+
+@app.post("/api/data")
+def add_data(body: AddDataRequest,
+             current_user: dict = Depends(get_current_user)):
+    """Append rows to the master table. Pure insert — no duplicate checks."""
+    rows = body.rows or []
+    if not rows:
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail="rows array is required and cannot be empty",
+        )
+
+    conn = get_connection()
+    try:
+        inserted = []
+        for row in rows:
+            if not isinstance(row, dict):
+                continue
+            new_id = insert_master_row(conn, row)
+            if new_id and new_id > 0:
+                inserted.append(new_id)
+        conn.commit()
+    finally:
+        conn.close()
+
+    return {"inserted": len(inserted), "ids": inserted}
+
+
+@app.delete("/api/data/{row_id}")
+def delete_data(row_id: int,
+                current_user: dict = Depends(get_current_user)):
+    """Delete a single master row by id."""
+    deleted = delete_master_row(row_id)
+    if deleted:
+        return {"message": f"Row {row_id} deleted"}
+    raise HTTPException(
+        status_code=status.HTTP_404_NOT_FOUND,
+        detail=f"Row {row_id} not found",
+    )
+
+
+# ── PDF Upload / Import ─────────────────────────────────────────────────────
+
+@app.post("/api/import/pdf")
+async def import_pdf(file: UploadFile = File(...),
+                     save: bool = Form(False),
+                     current_user: dict = Depends(get_current_user)):
+    """
+    Upload a PDF bank statement.
+    Parses the file and returns normalized rows.
+    If save=true, rows are also inserted into the master table.
+    """
+    if not file or not file.filename:
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail="No file provided",
+        )
+
+    filename = file.filename.lower()
+    if not filename.endswith(".pdf"):
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail="Only PDF files are supported",
+        )
+
+    file_bytes = await file.read()
+    if not file_bytes:
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail="Uploaded file is empty",
+        )
+
+    MAX_BYTES = 25 * 1024 * 1024  # 25 MB
+    if len(file_bytes) > MAX_BYTES:
+        raise HTTPException(
+            status_code=status.HTTP_413_REQUEST_ENTITY_TOO_LARGE,
+            detail="File too large (max 25 MB)",
+        )
+
+    # Lazy-import the parser so it doesn't load on every cold start
+    from parsers import parse_pdf
+
+    try:
+        result = parse_pdf(file_bytes)
+    except RuntimeError as e:
+        logger.error(f"PDF parse failed: {e}")
+        raise HTTPException(
+            status_code=status.HTTP_422_UNPROCESSABLE_ENTITY,
+            detail=str(e),
+        )
+    except Exception as e:
+        logger.exception("Unexpected error parsing PDF")
+        raise HTTPException(
+            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+            detail=f"Failed to parse PDF: {e}",
+        )
+
+    rows = result.get("rows", [])
+    bank = result.get("bank", "Unknown")
+
+    inserted_count = 0
+    if save and rows:
+        try:
+            conn = get_connection()
+            fieldmap_rows = get_field_mappings()
+            inserted_count = append_rows_to_master(conn, rows, fieldmap_rows)
+            conn.close()
+        except Exception as e:
+            logger.exception("Failed to save imported rows")
+            raise HTTPException(
+                status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+                detail=f"Parsed but failed to save: {e}",
+            )
+
+    return {
+        "bank": bank,
+        "rows": rows,
+        "row_count": len(rows),
+        "inserted": inserted_count,
+    }
 
 
 if __name__ == "__main__":
