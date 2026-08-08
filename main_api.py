@@ -720,7 +720,13 @@ def list_data(page: int = 1, limit: int = 50,
     page = max(1, page)
     limit = max(1, min(500, limit))
     offset = (page - 1) * limit
-    return get_master_rows(limit=limit, offset=offset)
+    try:
+        result = get_master_rows(limit=limit, offset=offset)
+        logger.info(f"GET /api/data: page={page}, limit={limit}, rows={len(result.get('rows', []))}, total={result.get('total', 0)}, cols={len(result.get('columns', []))}")
+        return result
+    except Exception as e:
+        logger.error(f"GET /api/data FAILED: {type(e).__name__}: {e}")
+        raise HTTPException(status_code=500, detail=f"Failed to fetch master data: {str(e)}")
 
 
 @app.post("/api/data")
