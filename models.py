@@ -65,6 +65,19 @@ def create_tables():
         )
         print("Added missing 'id' column to master table")
 
+    # Ensure id column is indexed for fast ORDER BY on data queries
+    cursor.execute(
+        """
+        SELECT 1 FROM pg_indexes
+        WHERE tablename='master' AND indexname='idx_master_id'
+        """
+    )
+    if cursor.fetchone() is None:
+        cursor.execute(
+            "CREATE INDEX idx_master_id ON master(id)"
+        )
+        print("Created index on master.id")
+
 
     conn.commit()
 
