@@ -234,6 +234,12 @@ async def delete_master_row(row_id: int) -> bool:
     return result != "DELETE 0"
 
 
+async def truncate_master() -> int:
+    result = await Database.execute("TRUNCATE TABLE master RESTART IDENTITY CASCADE")
+    count = await Database.fetchval("SELECT COUNT(*) FROM master")
+    return count
+
+
 async def get_next_field_number(field_type: str, conn) -> int:
     prefix_map = {"date": "field_date", "num": "field_num", "text": "field_text"}
     prefix = prefix_map.get(field_type, "")

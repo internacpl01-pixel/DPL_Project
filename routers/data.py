@@ -4,7 +4,7 @@ from fastapi import APIRouter, Depends, HTTPException, status
 from schemas import AddDataRequest
 from dependencies import get_current_user
 from database import Database
-from services.data import get_master_rows, insert_master_rows_bulk, delete_master_row
+from services.data import get_master_rows, insert_master_rows_bulk, delete_master_row, truncate_master
 
 router = APIRouter(prefix="/api", tags=["data"])
 
@@ -34,3 +34,9 @@ async def delete_data(row_id: int, current_user: dict = Depends(get_current_user
     if deleted:
         return {"message": f"Row {row_id} deleted"}
     raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail=f"Row {row_id} not found")
+
+
+@router.delete("/data")
+async def truncate_data(current_user: dict = Depends(get_current_user)):
+    count = await truncate_master()
+    return {"message": f"All data deleted ({count} rows remaining)", "deleted": True}
