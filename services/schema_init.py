@@ -66,10 +66,10 @@ async def create_tables():
 
 async def insert_default_mappings():
     defaults = [
-        ("date",        "Date",             "date,txn_date,value_date,transaction date"),
-        ("desc",        "Description",      "description,narration,particulars,remarks"),
+        ("date",        "Date",             "date,txn_date,value_date,transaction date,entry_date"),
+        ("desc",        "Description",      "description,narration,particulars,remarks,narrations"),
         ("withdrawal",  "Withdrawal",       "withdrawal,debit,dr,amount_out"),
-        ("deposits",    "Deposits",         "deposits,credit,cr,amount_in"),
+        ("deposits",    "Deposits",         "deposits,credit,cr,amount_in,deposit"),
         ("balance",     "Balance",          "balance,closing_balance,available_balance"),
     ]
     for fieldname, displayname, mapfields in defaults:
