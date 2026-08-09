@@ -205,9 +205,12 @@ async def append_rows_to_master(conn, rows: list, fieldmap_rows: list) -> int:
         flat_values.extend(row_vals)
 
     try:
-        placeholders_sql = ", ".join(
-            ["(" + ", ".join([f"${i+1}" for i in range(len(cols_list))]) + ")"] * len(all_rows)
-        )
+        row_placeholders = []
+        param_idx = 1
+        for _ in all_rows:
+            row_placeholders.append("(" + ", ".join([f"${param_idx + i}" for i in range(len(cols_list))]) + ")")
+            param_idx += len(cols_list)
+        placeholders_sql = ", ".join(row_placeholders)
         sql = f"INSERT INTO master ({cols_str}) VALUES {placeholders_sql}"
         logger.info(f"[Import] INSERT SQL: {sql[:200]}, params count: {len(flat_values)}")
         await conn.execute(sql, *flat_values)
