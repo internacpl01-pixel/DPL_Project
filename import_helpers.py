@@ -154,42 +154,27 @@ def build_master_insert(fields_map: dict, row_data: dict) -> tuple:
 
 
 async def append_rows_to_master(conn, rows: list, fieldmap_rows: list) -> int:
-    """
-    Append normalized rows to the master table.
-    No duplicate checks, no upsert, no delete-before-import.
-
-    Args:
-        conn: open psycopg2 connection
-        rows: list of normalized row dicts from the parser
-        fieldmap_rows: list of fieldmap dicts from the database
-
-    Returns:
-        Number of rows successfully inserted.
-    """
     if not rows:
         return 0
 
     alias_map = resolve_field_map(fieldmap_rows)
+    logger.info(f"[Import] fieldmap entries: {len(fieldmap_rows)}, alias_map keys: {sorted(alias_map.keys())}")
 
-    # Map parser keys → master columns via fieldmap
     parser_keys = ["date", "description", "withdrawal", "deposits", "balance"]
     resolved_fields = {pk: resolve_column(pk, alias_map) for pk in parser_keys}
+    logger.info(f"[Import] resolved_fields: {resolved_fields}")
 
-    inserted = 0
-
-    # Collect all row data and compute the union of columns
-    all_rows = []
-    cols_set = set()
-
-    # Gather live column names from the database
     live_col_rows = await conn.fetch(
         "SELECT column_name FROM information_schema.columns WHERE table_name='master'"
     )
     live_col_names = {r["column_name"] for r in live_col_rows}
+    logger.info(f"[Import] live master columns: {sorted(live_col_names)}")
 
-    for row in rows:
-        columns = []
-        values = []
+    all_rows = []
+    cols_set = set()
+
+    for idx, row in enumerate(rows):
+        columns, values = [], []
         for parser_key, master_col in resolved_fields.items():
             if not master_col or master_col not in live_col_names:
                 continue
@@ -198,9 +183,12 @@ async def append_rows_to_master(conn, rows: list, fieldmap_rows: list) -> int:
                 columns.append(master_col)
                 values.append(val)
         if not columns:
+            logger.info(f"[Import] row {idx}: SKIPPED — no matching columns, raw keys: {list(row.keys())}")
             continue
         cols_set.update(columns)
         all_rows.append((columns, values))
+
+    logger.info(f"[Import] all_rows count: {len(all_rows)}, cols_set: {sorted(cols_set)}")
 
     if not all_rows:
         return 0
@@ -220,13 +208,13 @@ async def append_rows_to_master(conn, rows: list, fieldmap_rows: list) -> int:
         placeholders_sql = ", ".join(
             ["(" + ", ".join([f"${i+1}" for i in range(len(cols_list))]) + ")"] * len(all_rows)
         )
-        await conn.execute(
-            f"INSERT INTO master ({cols_str}) VALUES {placeholders_sql}",
-            *flat_values,
-        )
+        sql = f"INSERT INTO master ({cols_str}) VALUES {placeholders_sql}"
+        logger.info(f"[Import] INSERT SQL: {sql[:200]}, params count: {len(flat_values)}")
+        await conn.execute(sql, *flat_values)
         inserted = len(all_rows)
+        logger.info(f"[Import] Inserted {inserted} rows")
     except Exception as e:
-        logger.error(f"Bulk insert failed: {e}")
+        logger.error(f"[Import] Bulk insert FAILED: {e}")
+        inserted = 0
 
-    logger.info(f"Inserted {inserted}/{len(rows)} rows into master")
     return inserted
