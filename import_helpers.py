@@ -208,6 +208,12 @@ async def append_rows_to_master(conn, rows: list, fieldmap_rows: list) -> int:
                     val = float(str(val).replace(",", ""))
                 except (ValueError, TypeError):
                     val = None
+            elif col == "date" and val is not None and val != "":
+                try:
+                    from datetime import datetime
+                    val = datetime.strptime(str(val), "%Y-%m-%d").date()
+                except (ValueError, TypeError):
+                    val = None
             row_vals[col_indices[col]] = val
         flat_values.extend(row_vals)
 
