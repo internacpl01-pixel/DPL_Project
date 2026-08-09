@@ -1,4 +1,3 @@
-# Force Docker rebuild - date fix deployed
 fastapi==0.141.1
 uvicorn==0.52.1
 asyncpg==0.30.0
