@@ -143,8 +143,9 @@ async def create_custom_field(body: CustomFieldRequest, current_user: dict = Dep
 
     async with Database.acquire() as conn:
         rows = await conn.fetch(
-            f"SELECT column_name FROM information_schema.columns "
-            f"WHERE table_name = 'master' AND column_name LIKE '{prefix}_%' ORDER BY column_name"
+            "SELECT column_name FROM information_schema.columns "
+            "WHERE table_name = 'master' AND column_name LIKE $1 ORDER BY column_name",
+            prefix + "_%",
         )
         max_num = 0
         for row in rows:
@@ -157,8 +158,10 @@ async def create_custom_field(body: CustomFieldRequest, current_user: dict = Dep
         next_num = max_num + 1
         col_name = f"{prefix}_{next_num}"
         await conn.execute(
-            f"ALTER TABLE master ADD COLUMN IF NOT EXISTS {col_name} {sql_type}"
+            "ALTER TABLE master ADD COLUMN IF NOT EXISTS " + col_name + " " + sql_type
         )
+        from services.data import _invalidate_live_cols_cache
+        _invalidate_live_cols_cache()
         await conn.execute(
             "INSERT INTO fieldmap (fieldname, displayname, mapfields) VALUES ($1, $2, $3) "
             "ON CONFLICT (fieldname) DO UPDATE SET displayname=EXCLUDED.displayname, mapfields=EXCLUDED.mapfields",

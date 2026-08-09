@@ -1,7 +1,7 @@
 """Master data service — CRUD for the master table."""
 import logging
+import re
 import time as _time
-import asyncpg
 from datetime import date as _date
 from database import Database
 from import_helpers import resolve_field_map, resolve_column
@@ -9,21 +9,40 @@ from services.mappings import get_field_mappings
 
 logger = logging.getLogger(__name__)
 
-_PARSER_KEYS = ("date", "description", "withdrawal", "deposits", "balance")
 
-_MASTER_COLUMNS = [
-    "date", "desc", "withdrawal", "deposits", "balance",
-    "field_date_1", "field_date_2", "field_date_3",
-    "field_date_4", "field_date_5",
-    "field_num_1", "field_num_2", "field_num_3", "field_num_4",
-    "field_num_5", "field_num_6", "field_num_7", "field_num_8",
-    "field_num_9", "field_num_10",
-    "field_text_1", "field_text_2", "field_text_3", "field_text_4",
-    "field_text_5", "field_text_6", "field_text_7", "field_text_8",
-    "field_text_9", "field_text_10", "field_text_11", "field_text_12",
-    "field_text_13", "field_text_14", "field_text_15", "field_text_16",
-    "field_text_17", "field_text_18", "field_text_19", "field_text_20",
-]
+def _parse_date(val) -> _date | None:
+    """Parse various date string formats into a datetime.date object."""
+    s = str(val).strip()
+    if not s:
+        return None
+    # YYYY-MM-DD
+    if len(s) == 10 and s[4] == "-":
+        try:
+            return _date.fromisoformat(s)
+        except ValueError:
+            pass
+    # DD/MM/YYYY or DD-MM-YYYY
+    m = re.match(r"(\d{2})[/\-](\d{2})[/\-](\d{4})", s)
+    if m:
+        try:
+            return _date(int(m.group(3)), int(m.group(2)), int(m.group(1)))
+        except ValueError:
+            pass
+    # DD-Mon-YYYY
+    m = re.match(r"(\d{2})-([A-Za-z]{3})-(\d{4})", s)
+    if m:
+        month_map = {"jan":1,"feb":2,"mar":3,"apr":4,"may":5,"jun":6,
+                     "jul":7,"aug":8,"sep":9,"oct":10,"nov":11,"dec":12}
+        mon = month_map.get(m.group(2).lower())
+        if mon:
+            try:
+                return _date(int(m.group(3)), mon, int(m.group(1)))
+            except ValueError:
+                pass
+    return None
+
+
+_PARSER_KEYS = ("date", "description", "withdrawal", "deposits", "balance")
 
 _LIVE_COLS_CACHE = {"cols": None, "expires_at": 0}
 _LIVE_COLS_TTL = 30
@@ -112,11 +131,9 @@ async def insert_master_row(conn, row_data: dict) -> int:
                         val = None
                 elif sql_type == "date":
                     if isinstance(val, str) and val:
-                        try:
-                            parts = val.split("-")
-                            val = _date(int(parts[0]), int(parts[1]), int(parts[2]))
-                        except (ValueError, IndexError):
-                            val = None
+                        val = _parse_date(val)
+                    if val is None:
+                        continue
                 if val is not None:
                     columns.append(col_name)
                     values.append(val)
@@ -171,11 +188,9 @@ async def insert_master_rows_bulk(conn, rows: list) -> int:
                             val = None
                     elif sql_type == "date":
                         if isinstance(val, str) and val:
-                            try:
-                                parts = val.split("-")
-                                val = _date(int(parts[0]), int(parts[1]), int(parts[2]))
-                            except (ValueError, IndexError):
-                                val = None
+                            val = _parse_date(val)
+                        if val is None:
+                            continue
                     if val is not None:
                         columns.append(col_name)
                         values.append(val)
@@ -222,9 +237,13 @@ async def delete_master_row(row_id: int) -> bool:
 async def get_next_field_number(field_type: str, conn) -> int:
     prefix_map = {"date": "field_date", "num": "field_num", "text": "field_text"}
     prefix = prefix_map.get(field_type, "")
+    if not prefix:
+        return 1
+    pattern = prefix + "_%"
     rows = await conn.fetch(
-        f"SELECT column_name FROM information_schema.columns "
-        f"WHERE table_name = 'master' AND column_name LIKE '{prefix}_%' ORDER BY column_name"
+        "SELECT column_name FROM information_schema.columns "
+        "WHERE table_name = 'master' AND column_name LIKE $1 ORDER BY column_name",
+        pattern,
     )
     max_num = 0
     for row in rows:
@@ -235,21 +254,3 @@ async def get_next_field_number(field_type: str, conn) -> int:
         except ValueError:
             pass
     return max_num + 1
-
-
-async def add_custom_field(field_type: str) -> str:
-    type_map = {"date": ("DATE", "field_date"), "num": ("REAL", "field_num"), "text": ("TEXT", "field_text")}
-    sql_type, prefix = type_map.get(field_type, ("TEXT", "field_text"))
-
-    from database import _connect
-    conn = await _connect()
-    try:
-        next_num = await get_next_field_number(field_type, conn)
-        col_name = f"{prefix}_{next_num}"
-        await conn.execute(
-            f"ALTER TABLE master ADD COLUMN IF NOT EXISTS {col_name} {sql_type}"
-        )
-        _invalidate_live_cols_cache()
-        return col_name
-    finally:
-        await conn.close()

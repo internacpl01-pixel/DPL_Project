@@ -7,7 +7,9 @@ load_dotenv()
 DATABASE_URL = os.getenv("DATABASE_URL", "")
 DB_NAME = os.getenv("DB_NAME", "dpl_database")
 DB_USER = os.getenv("DB_USER", "postgres")
-DB_PASSWORD = os.getenv("DB_PASSWORD", "Post123@")
+DB_PASSWORD = os.getenv("DB_PASSWORD", "")
+if not DB_PASSWORD:
+    raise RuntimeError("DB_PASSWORD environment variable is not set.")
 DB_HOST = os.getenv("DB_HOST", "localhost")
 DB_PORT = os.getenv("DB_PORT", "5432")
 
@@ -62,20 +64,3 @@ class Database:
         if cls.pool is None:
             raise RuntimeError("Database not connected.")
         return cls.pool.acquire()
-
-    @classmethod
-    async def _ddl(cls, query: str):
-        conn = await asyncpg.connect(await _get_dsn())
-        try:
-            await conn.execute(query)
-        finally:
-            await conn.close()
-
-
-async def _connect():
-    return await asyncpg.connect(await _get_dsn())
-
-
-async def get_conn():
-    """Return a raw asyncpg connection for DDL / ALTER TABLE statements."""
-    return await _connect()

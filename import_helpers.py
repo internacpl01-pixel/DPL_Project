@@ -6,9 +6,41 @@ and appending rows to the master table.
 
 import logging
 import re
-import io
+from datetime import date as _date
 
 logger = logging.getLogger(__name__)
+
+
+def _parse_date_to_date(val) -> _date | None:
+    """Parse various date string formats into a datetime.date object."""
+    s = str(val).strip()
+    if not s:
+        return None
+    # YYYY-MM-DD
+    if len(s) == 10 and s[4] == "-":
+        try:
+            return _date.fromisoformat(s)
+        except ValueError:
+            pass
+    # DD/MM/YYYY or DD-MM-YYYY
+    m = re.match(r"(\d{2})[/\-](\d{2})[/\-](\d{4})", s)
+    if m:
+        try:
+            return _date(int(m.group(3)), int(m.group(2)), int(m.group(1)))
+        except ValueError:
+            pass
+    # DD-Mon-YYYY
+    m = re.match(r"(\d{2})-([A-Za-z]{3})-(\d{4})", s)
+    if m:
+        month_map = {"jan":1,"feb":2,"mar":3,"apr":4,"may":5,"jun":6,
+                     "jul":7,"aug":8,"sep":9,"oct":10,"nov":11,"dec":12}
+        mon = month_map.get(m.group(2).lower())
+        if mon:
+            try:
+                return _date(int(m.group(3)), mon, int(m.group(1)))
+            except ValueError:
+                pass
+    return None
 
 
 def resolve_field_map(fieldmap_rows: list) -> dict:
@@ -158,17 +190,13 @@ async def append_rows_to_master(conn, rows: list, fieldmap_rows: list) -> int:
         return 0
 
     alias_map = resolve_field_map(fieldmap_rows)
-    logger.info(f"[Import] fieldmap entries: {len(fieldmap_rows)}, alias_map keys: {sorted(alias_map.keys())}")
-
     parser_keys = ["date", "description", "withdrawal", "deposits", "balance"]
     resolved_fields = {pk: resolve_column(pk, alias_map) for pk in parser_keys}
-    logger.info(f"[Import] resolved_fields: {resolved_fields}")
 
     live_col_rows = await conn.fetch(
         "SELECT column_name FROM information_schema.columns WHERE table_name='master'"
     )
     live_col_names = {r["column_name"] for r in live_col_rows}
-    logger.info(f"[Import] live master columns: {sorted(live_col_names)}")
 
     all_rows = []
     cols_set = set()
@@ -183,12 +211,9 @@ async def append_rows_to_master(conn, rows: list, fieldmap_rows: list) -> int:
                 columns.append(master_col)
                 values.append(val)
         if not columns:
-            logger.info(f"[Import] row {idx}: SKIPPED — no matching columns, raw keys: {list(row.keys())}")
             continue
         cols_set.update(columns)
         all_rows.append((columns, values))
-
-    logger.info(f"[Import] all_rows count: {len(all_rows)}, cols_set: {sorted(cols_set)}")
 
     if not all_rows:
         return 0
@@ -209,28 +234,19 @@ async def append_rows_to_master(conn, rows: list, fieldmap_rows: list) -> int:
                 except (ValueError, TypeError):
                     val = None
             elif col == "date" and val is not None and val != "":
-                try:
-                    from datetime import datetime
-                    val = datetime.strptime(str(val), "%Y-%m-%d").date()
-                except (ValueError, TypeError):
-                    val = None
+                if isinstance(val, str):
+                    val = _parse_date_to_date(val)
+                if val is None:
+                    continue
             row_vals[col_indices[col]] = val
         flat_values.extend(row_vals)
 
-    try:
-        row_placeholders = []
-        param_idx = 1
-        for _ in all_rows:
-            row_placeholders.append("(" + ", ".join([f"${param_idx + i}" for i in range(len(cols_list))]) + ")")
-            param_idx += len(cols_list)
-        placeholders_sql = ", ".join(row_placeholders)
-        sql = f"INSERT INTO master ({cols_str}) VALUES {placeholders_sql}"
-        logger.info(f"[Import] INSERT SQL: {sql[:200]}, params count: {len(flat_values)}")
-        await conn.execute(sql, *flat_values)
-        inserted = len(all_rows)
-        logger.info(f"[Import] Inserted {inserted} rows")
-    except Exception as e:
-        logger.error(f"[Import] Bulk insert FAILED: {e}")
-        inserted = 0
-
-    return inserted
+    row_placeholders = []
+    param_idx = 1
+    for _ in all_rows:
+        row_placeholders.append("(" + ", ".join([f"${param_idx + i}" for i in range(len(cols_list))]) + ")")
+        param_idx += len(cols_list)
+    placeholders_sql = ", ".join(row_placeholders)
+    sql = f"INSERT INTO master ({cols_str}) VALUES {placeholders_sql}"
+    await conn.execute(sql, *flat_values)
+    return len(all_rows)
