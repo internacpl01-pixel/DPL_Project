@@ -198,10 +198,17 @@ async def append_rows_to_master(conn, rows: list, fieldmap_rows: list) -> int:
     cols_str = ", ".join(f'"{c}"' if c == 'desc' else c for c in cols_list)
 
     flat_values = []
+    NUMERIC_COLS = {"withdrawal", "deposits", "balance"}
     for columns, values in all_rows:
         row_vals = [None] * len(cols_list)
         for i, col in enumerate(columns):
-            row_vals[col_indices[col]] = values[i]
+            val = values[i]
+            if col in NUMERIC_COLS and val is not None and val != "":
+                try:
+                    val = float(str(val).replace(",", ""))
+                except (ValueError, TypeError):
+                    val = None
+            row_vals[col_indices[col]] = val
         flat_values.extend(row_vals)
 
     try:
