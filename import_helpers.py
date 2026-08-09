@@ -182,6 +182,10 @@ async def append_rows_to_master(conn, rows: list, fieldmap_rows: list) -> int:
             if val != "" and val is not None:
                 columns.append(master_col)
                 values.append(val)
+        # DEBUG: log first row's date value
+        if idx == 0:
+            import json as _json
+            logger.info(f"[DEBUG] row0 raw={_json.dumps(row)}, cols={columns}, vals={values}")
         if not columns:
             logger.info(f"[Import] row {idx}: SKIPPED — no matching columns, raw keys: {list(row.keys())}")
             continue
