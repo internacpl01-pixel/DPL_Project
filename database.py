@@ -8,8 +8,8 @@ DATABASE_URL = os.getenv("DATABASE_URL", "")
 DB_NAME = os.getenv("DB_NAME", "dpl_database")
 DB_USER = os.getenv("DB_USER", "postgres")
 DB_PASSWORD = os.getenv("DB_PASSWORD", "")
-if not DB_PASSWORD:
-    raise RuntimeError("DB_PASSWORD environment variable is not set.")
+if not DATABASE_URL and not DB_PASSWORD:
+    raise RuntimeError("Set DATABASE_URL or DB_PASSWORD environment variable.")
 DB_HOST = os.getenv("DB_HOST", "localhost")
 DB_PORT = os.getenv("DB_PORT", "5432")
 
