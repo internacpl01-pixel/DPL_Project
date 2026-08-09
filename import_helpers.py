@@ -203,6 +203,7 @@ async def append_rows_to_master(conn, rows: list, fieldmap_rows: list) -> int:
         row_vals = [None] * len(cols_list)
         for i, col in enumerate(columns):
             val = values[i]
+            raw_val = val
             if col in NUMERIC_COLS and val is not None and val != "":
                 try:
                     val = float(str(val).replace(",", ""))
@@ -214,6 +215,8 @@ async def append_rows_to_master(conn, rows: list, fieldmap_rows: list) -> int:
                     val = datetime.strptime(str(val), "%Y-%m-%d").date()
                 except (ValueError, TypeError):
                     val = None
+            if col == "date" and val is None:
+                logger.warning(f"[Import] date parse FAILED for raw={raw_val!r} → set to NULL")
             row_vals[col_indices[col]] = val
         flat_values.extend(row_vals)
 
