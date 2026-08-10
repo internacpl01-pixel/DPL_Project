@@ -634,8 +634,11 @@ def _parse_sbi(text: str) -> list:
 # ── YES Bank parser ────────────────────────────────────────────────────────
 
 def _parse_yesbank(text: str) -> list:
-    """Parse YES Bank statement text using coordinate-based extraction."""
-    return _parse_yesbank_coordinate_from_text(text)
+    """Parse YES Bank statement text."""
+    rows = _parse_yesbank_coordinate_from_text(text)
+    if not rows:
+        rows = _parse_yesbank_text_fallback(text)
+    return rows
 
 
 def _parse_yesbank_text_fallback(text: str) -> list:
@@ -1230,10 +1233,7 @@ def parse_pdf(file_bytes: bytes, password: str = "") -> dict:
     rows = []
     try:
         if bank == BANK_YES:
-            rows = _parse_yesbank_coords(file_bytes)
-            if not rows and text.strip():
-                logger.info("Coordinate parser returned 0 rows, trying text fallback")
-                rows = _parse_yesbank_text_fallback(text)
+            rows = _parse_yesbank(text)
         else:
             parser_fn = _PARSERS.get(bank, _parse_generic)
             rows = parser_fn(text)
