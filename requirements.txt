@@ -6,6 +6,5 @@ python-dotenv==1.2.2
 python-jose[cryptography]==3.5.0
 python-multipart==0.0.32
 pdfplumber==0.11.4
-pikepdf==9.5.0
 pytesseract==0.3.10
 pdf2image==1.17.0

@@ -12,16 +12,10 @@ from collections import defaultdict
 logger = logging.getLogger(__name__)
 
 try:
-    from pypdf import PdfReader
+    from pypdf import PdfReader, PdfWriter
     PYPDF_AVAILABLE = True
 except ImportError:
     PYPDF_AVAILABLE = False
-
-try:
-    import pikepdf
-    PIKEPDF_AVAILABLE = True
-except ImportError:
-    PIKEPDF_AVAILABLE = False
 
 try:
     import pdfplumber
@@ -112,42 +106,28 @@ def check_pdf_protected(file_bytes: bytes) -> bool:
 
 
 def decrypt_pdf(file_bytes: bytes, password: str) -> bytes:
-    """Decrypt a password-protected PDF and return decrypted bytes."""
+    """Decrypt a password-protected PDF and return decrypted bytes using pypdf."""
     if not password:
         raise ValueError("Password is required for encrypted PDF")
 
-    if PIKEPDF_AVAILABLE:
-        try:
-            import io
-            with pikepdf.open(io.BytesIO(file_bytes), password=password) as pdf:
-                out = io.BytesIO()
-                pdf.save(out)
-                return out.getvalue()
-        except pikepdf.PasswordError:
-            raise RuntimeError("Incorrect password. Please try again.")
-        except Exception as e:
-            raise RuntimeError(f"Failed to decrypt PDF: {e}")
+    if not PYPDF_AVAILABLE:
+        raise RuntimeError("pypdf is required for PDF decryption")
 
-    if PYPDF_AVAILABLE:
-        try:
-            reader = PdfReader(io.BytesIO(file_bytes))
-            reader.decrypt(password)
-            if reader.is_encrypted:
-                raise RuntimeError("Incorrect password. Please try again.")
-            out = io.BytesIO()
-            writer = __import__("pypdf").PdfWriter()
-            for page in reader.pages:
-                writer.add_page(page)
-            writer.write(out)
-            return out.getvalue()
-        except __import__("pypdf").PasswordError:
+    try:
+        reader = PdfReader(io.BytesIO(file_bytes))
+        reader.decrypt(password)
+        if reader.is_encrypted:
             raise RuntimeError("Incorrect password. Please try again.")
-        except Exception as e:
-            raise RuntimeError(f"Failed to decrypt PDF: {e}")
-
-    raise RuntimeError(
-        "No PDF decryption library available. Install pypdf or pikepdf."
-    )
+        out = io.BytesIO()
+        writer = PdfWriter()
+        for page in reader.pages:
+            writer.add_page(page)
+        writer.write(out)
+        return out.getvalue()
+    except Exception as e:
+        if "incorrect" in str(e).lower() or "password" in str(e).lower():
+            raise RuntimeError("Incorrect password. Please try again.")
+        raise RuntimeError(f"Failed to decrypt PDF: {e}")
 
 
 def has_sufficient_text(text: str, min_chars: int = 200) -> bool:
