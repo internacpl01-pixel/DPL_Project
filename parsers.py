@@ -1,16 +1,14 @@
-
 """
 Generic PDF statement parser.
-Extracts text from any PDF, detects the bank (for reporting only),
-and parses transaction rows using fieldmap aliases for column mapping.
-No bank-specific logic needed — master table columns are filled based
-on the fieldmap table configuration.
+Uses pdfplumber table extraction + word-coordinate fallback.
+No bank-specific logic — fieldmap table drives all column mapping.
 """
 
 import io
 import re
 import logging
 import time
+from collections import defaultdict
 
 logger = logging.getLogger(__name__)
 
@@ -30,7 +28,6 @@ except ImportError:
 # ── PDF text extraction ─────────────────────────────────────────────────────
 
 def check_pdf_protected(file_bytes: bytes) -> bool:
-    """Check if a PDF is password-protected using pypdf."""
     if not PYPDF_AVAILABLE:
         return False
     try:
@@ -41,7 +38,6 @@ def check_pdf_protected(file_bytes: bytes) -> bool:
 
 
 def decrypt_pdf(file_bytes: bytes, password: str) -> bytes:
-    """Decrypt a password-protected PDF and return decrypted bytes using pypdf."""
     if not password:
         raise RuntimeError(
             "ENCRYPTED: This PDF is password-protected. "
@@ -71,7 +67,6 @@ def decrypt_pdf(file_bytes: bytes, password: str) -> bytes:
 
 
 def extract_text_from_pdf(file_bytes: bytes) -> str:
-    """Extract all text from a PDF using pdfplumber."""
     if not PDFPLUMBER_AVAILABLE:
         raise RuntimeError("pdfplumber is not installed")
     pages_text = []
@@ -91,34 +86,334 @@ def extract_text_from_pdf(file_bytes: bytes) -> str:
 
 # ── Helpers ─────────────────────────────────────────────────────────────────
 
-def _clean_amount(val: str) -> str:
-    """Strip currency symbols, commas, and whitespace from an amount string."""
-    if not val:
+def _clean_amount(val) -> str:
+    """Strip currency symbols, commas, spaces from an amount."""
+    if val is None:
         return ""
-    return re.sub(r"[RsINR,\s]", "", val).strip()
+    s = str(val).strip()
+    if not s:
+        return ""
+    s = re.sub(r"[RsINR,\s]", "", s)
+    # Handle Dr/Cr suffix
+    if s.upper().endswith("DR") and not s.endswith("-"):
+        s = "-" + s[:-2].strip()
+    elif s.upper().endswith("CR"):
+        s = s[:-2].strip()
+    return s.strip()
 
 
-def _parse_date(val: str) -> str:
-    """Normalize a date string to ISO format (best-effort)."""
-    val = val.strip()
-    if not val:
+def _parse_date(val) -> str:
+    """Normalize a date string to ISO format."""
+    if val is None:
         return ""
-    if re.match(r"\d{4}-\d{2}-\d{2}", val):
-        return val[:10]
-    m = re.match(r"(\d{2})[/\-](\d{2})[/\-](\d{4})", val)
+    s = str(val).strip()
+    if not s:
+        return ""
+    # Already ISO
+    if re.match(r"\d{4}-\d{2}-\d{2}", s):
+        return s[:10]
+    # DD/MM/YYYY or DD-MM-YYYY
+    m = re.match(r"(\d{1,2})[/\-](\d{1,2})[/\-](\d{4})", s)
     if m:
-        return f"{m.group(3)}-{m.group(2)}-{m.group(1)}"
-    m = re.match(r"(\d{2})-([A-Za-z]{3})-(\d{4})", val)
+        return f"{m.group(3)}-{int(m.group(2)):02d}-{int(m.group(1)):02d}"
+    # DD-Mon-YYYY or DD-Mon-YY
+    m = re.match(r"(\d{1,2})-([A-Za-z]{3,})-(\d{2,4})", s)
     if m:
         month_map = {
             "jan": "01", "feb": "02", "mar": "03", "apr": "04",
             "may": "05", "jun": "06", "jul": "07", "aug": "08",
             "sep": "09", "oct": "10", "nov": "11", "dec": "12",
         }
-        mon = month_map.get(m.group(2).lower())
+        mon = month_map.get(m.group(2).lower()[:3])
         if mon:
-            return f"{m.group(3)}-{mon}-{m.group(1)}"
-    return val
+            year = m.group(3)
+            if len(year) == 2:
+                year = "20" + year
+            return f"{year}-{mon}-{int(m.group(1)):02d}"
+    return s
+
+
+def _parse_date_to_date(val):
+    """Parse date string to datetime.date object for asyncpg."""
+    s = _parse_date(val)
+    if not s:
+        return None
+    try:
+        from datetime import date
+        parts = s.split("-")
+        return date(int(parts[0]), int(parts[1]), int(parts[2]))
+    except Exception:
+        return None
+
+
+# ── Normalization ───────────────────────────────────────────────────────────
+
+def _normalize_for_matching(s: str) -> str:
+    """Normalize a string for alias matching: lowercase, strip punctuation/underscores, collapse spaces."""
+    s = s.strip().lower()
+    s = re.sub(r"[^\w\s]", "", s)  # remove punctuation
+    s = re.sub(r"_", " ", s)       # underscores → spaces
+    s = re.sub(r"\s+", " ", s)     # collapse spaces
+    return s.strip()
+
+
+def _build_alias_map(fieldmap_rows: list) -> dict:
+    """Build {normalized_alias: fieldname} from fieldmap rows."""
+    alias_map = {}
+    for row in (fieldmap_rows or []):
+        fieldname = row.get("fieldname", "")
+        mapfields = row.get("mapfields", "")
+        for alias in mapfields.split(","):
+            alias = alias.strip()
+            if alias:
+                norm = _normalize_for_matching(alias)
+                alias_map[norm] = fieldname
+    return alias_map
+
+
+def _match_alias(header: str, alias_map: dict) -> tuple:
+    """
+    Match a PDF column header against the alias map.
+    Priority: exact > starts-with > contains. Longest alias first.
+    Returns (fieldname, confidence) or (None, 0).
+    """
+    norm = _normalize_for_matching(header)
+    if not norm:
+        return None, 0
+
+    # Sort aliases by length descending for longest-match-first
+    sorted_aliases = sorted(alias_map.keys(), key=len, reverse=True)
+
+    # 1. Exact match
+    if norm in alias_map:
+        return alias_map[norm], 3
+
+    # 2. Starts-with
+    for alias in sorted_aliases:
+        if norm.startswith(alias) or alias.startswith(norm):
+            return alias_map[alias], 2
+
+    # 3. Contains (one contains the other)
+    for alias in sorted_aliases:
+        if norm in alias or alias in norm:
+            return alias_map[alias], 1
+
+    return None, 0
+
+
+# ── Table extraction ────────────────────────────────────────────────────────
+
+def _extract_tables_from_pdf(file_bytes: bytes) -> list:
+    """
+    Extract tables from PDF using pdfplumber.
+    Returns list of tables, each table is a list of rows (each row is a list of cell strings).
+    """
+    if not PDFPLUMBER_AVAILABLE:
+        return []
+    tables = []
+    try:
+        with pdfplumber.open(io.BytesIO(file_bytes)) as pdf:
+            for page in pdf.pages:
+                page_tables = page.extract_tables()
+                if page_tables:
+                    tables.extend(page_tables)
+    except Exception as e:
+        logger.warning(f"[Parser] Table extraction failed: {e}")
+    return tables
+
+
+def _extract_table_by_coordinates(file_bytes: bytes) -> list:
+    """
+    Fallback: extract table structure using word coordinates.
+    Groups words into rows by y-position, columns by x-position.
+    """
+    if not PDFPLUMBER_AVAILABLE:
+        return []
+    tables = []
+    try:
+        with pdfplumber.open(io.BytesIO(file_bytes)) as pdf:
+            for page in pdf.pages:
+                words = page.extract_words()
+                if not words:
+                    continue
+
+                # Group words into rows by y-position (cluster within 3px)
+                rows_by_y = defaultdict(list)
+                for w in words:
+                    y_key = round(float(w["top"]) / 3) * 3
+                    rows_by_y[y_key].append(w)
+
+                # Sort rows by y position (top to bottom)
+                sorted_rows = sorted(rows_by_y.items(), key=lambda x: x[0])
+
+                if len(sorted_rows) < 2:
+                    continue
+
+                # Get x-positions from first row (header candidates)
+                header_words = sorted(sorted_rows[0][1], key=lambda w: float(w["x0"]))
+                x_boundaries = []
+                for w in header_words:
+                    x_boundaries.append(float(w["x0"]))
+
+                # Group each row into columns based on x_boundaries
+                table_rows = []
+                for y_key, row_words in sorted_rows:
+                    row_words_sorted = sorted(row_words, key=lambda w: float(w["x0"]))
+                    cells = []
+                    for xb in x_boundaries:
+                        cell_words = [w["text"] for w in row_words_sorted
+                                     if abs(float(w["x0"]) - xb) < 30 or
+                                     (cells and float(w["x0"]) < xb + 50)]
+                        cells.append(" ".join(cell_words) if cell_words else "")
+                    table_rows.append(cells)
+
+                if table_rows:
+                    tables.append(table_rows)
+    except Exception as e:
+        logger.warning(f"[Parser] Coordinate extraction failed: {e}")
+    return tables
+
+
+# ── Header detection ────────────────────────────────────────────────────────
+
+def _detect_header_row(table_rows: list, alias_map: dict) -> tuple:
+    """
+    Find the header row in a table by matching ≥3 cells against fieldmap aliases.
+    Returns (header_row_index, column_mapping) or (-1, None).
+
+    column_mapping = {col_index: fieldname, ...}
+    """
+    best_score = 0
+    best_idx = -1
+    best_mapping = None
+
+    for idx, row in enumerate(table_rows):
+        if not row or len(row) < 2:
+            continue
+
+        mapping = {}
+        score = 0
+        for col_idx, cell in enumerate(row):
+            cell = str(cell).strip()
+            if not cell or len(cell) < 2:
+                continue
+            fieldname, confidence = _match_alias(cell, alias_map)
+            if fieldname:
+                mapping[col_idx] = fieldname
+                score += confidence
+
+        if score > best_score and len(mapping) >= 2:
+            best_score = score
+            best_idx = idx
+            best_mapping = mapping
+
+    return best_idx, best_mapping
+
+
+# ── Row assembly ────────────────────────────────────────────────────────────
+
+_FOOTER_KEYWORDS = {
+    "total", "closing balance", "b/f", "c/f", "b/fwd", "c/fwd",
+    "opening balance", "summary", "grand total", "page",
+}
+
+_DATE_COLS_CANONICAL = {"date", "value_date", "entry_date", "tran_date", "txn_date"}
+
+
+def _is_footer_row(row_cells: list, col_mapping: dict) -> bool:
+    """Check if a row is a footer/summary row."""
+    for col_idx, cell in enumerate(row_cells):
+        cell_lower = str(cell).strip().lower()
+        if col_idx in col_mapping and col_mapping[col_idx] == "description":
+            for kw in _FOOTER_KEYWORDS:
+                if kw in cell_lower:
+                    return True
+    return False
+
+
+def _has_valid_date(row_cells: list, col_mapping: dict, date_col_idx: int) -> bool:
+    """Check if a row has a valid date in the date column."""
+    if date_col_idx is None or date_col_idx >= len(row_cells):
+        return False
+    val = str(row_cells[date_col_idx]).strip()
+    return bool(_parse_date_to_date(val))
+
+
+def _assemble_rows(table_rows: list, header_idx: int, col_mapping: dict) -> list:
+    """
+    Assemble transaction rows from table data.
+    Handles multi-line descriptions (date-less rows following a date row).
+    Skips footer/summary rows.
+    """
+    # Find the date column
+    date_col = None
+    for col_idx, fieldname in col_mapping.items():
+        if fieldname in _DATE_COLS_CANONICAL:
+            date_col = col_idx
+            break
+
+    rows = []
+    current_row = None
+
+    for row_idx in range(header_idx + 1, len(table_rows)):
+        row_cells = table_rows[row_idx]
+
+        if not row_cells:
+            continue
+
+        # Clean empty cells
+        row_cells = [str(c).strip() if c else "" for c in row_cells]
+
+        # Skip footer/summary rows
+        if _is_footer_row(row_cells, col_mapping):
+            if current_row:
+                rows.append(current_row)
+                current_row = None
+            continue
+
+        # Check if this row has a valid date
+        if date_col is not None and _has_valid_date(row_cells, date_col):
+            # Save previous row
+            if current_row and current_row.get("date"):
+                rows.append(current_row)
+
+            # Start new row
+            current_row = {
+                "date": _parse_date(row_cells[date_col]),
+                "description": "",
+                "withdrawal": "",
+                "deposits": "",
+                "balance": "",
+                "reference_no": "",
+            }
+            # Fill other columns
+            for col_idx, cell in enumerate(row_cells):
+                if col_idx == date_col:
+                    continue
+                fieldname = col_mapping.get(col_idx)
+                if not fieldname:
+                    continue
+                if fieldname == "description":
+                    current_row["description"] = cell
+                elif fieldname == "withdrawal":
+                    current_row["withdrawal"] = cell
+                elif fieldname == "deposits":
+                    current_row["deposits"] = cell
+                elif fieldname == "balance":
+                    current_row["balance"] = cell
+                elif fieldname == "reference_no":
+                    current_row["reference_no"] = cell
+        elif current_row and current_row.get("date"):
+            # Continuation of previous row — append description
+            desc_parts = [c for c in row_cells if c]
+            if desc_parts:
+                current_row["description"] += " " + " ".join(desc_parts)
+
+    # Save last row
+    if current_row and current_row.get("date"):
+        rows.append(current_row)
+
+    return rows
 
 
 # ── Generic parser ──────────────────────────────────────────────────────────
@@ -127,19 +422,23 @@ def parse_pdf(file_bytes: bytes, password: str = "", fieldmap_rows: list = None)
     """
     Parse a PDF bank statement and return normalized rows.
 
-    Works for any bank — no per-bank logic. Extracts text, finds rows
-    by date patterns, and returns dicts with keys: date, description,
-    withdrawal, deposits, balance, reference_no.
-
-    The fieldmap table is used downstream to map these to master columns.
+    Works for any bank — no per-bank logic.
+    Uses pdfplumber table extraction → fieldmap-driven column mapping.
 
     Args:
         file_bytes: raw PDF bytes
         password: optional password for encrypted PDFs
-        fieldmap_rows: list of fieldmap dicts (from get_field_mappings)
+        fieldmap_rows: list of fieldmap dicts from get_field_mappings()
 
     Returns:
-        {"bank": str, "rows": [...], "raw_text": str}
+        {
+            "bank": str,
+            "rows": [{"date", "description", "withdrawal", "deposits", "balance", "reference_no"}, ...],
+            "row_count": int,
+            "headers_detected": {col_name: fieldname, ...},
+            "unmapped_headers": [header_text, ...],
+            "raw_text": str
+        }
     """
     if not PDFPLUMBER_AVAILABLE:
         raise RuntimeError("pdfplumber is not installed. Add it to requirements.txt.")
@@ -157,40 +456,100 @@ def parse_pdf(file_bytes: bytes, password: str = "", fieldmap_rows: list = None)
 
     t1 = time.perf_counter()
 
-    text = extract_text_from_pdf(file_bytes)
+    # Build alias map from fieldmap (for header matching)
+    alias_map = _build_alias_map(fieldmap_rows or [])
+
+    # Try table extraction first
+    tables = _extract_tables_from_pdf(file_bytes)
 
     t2 = time.perf_counter()
-    logger.info(f"[Parser] text extraction: {(t2 - t1) * 1000:.0f}ms, chars={len(text)}")
 
-    if not text.strip():
-        raise RuntimeError(
-            "PDF appears to be empty or could not be read. "
-            "Please upload a valid text-based PDF."
-        )
+    bank = "Unknown"
+    rows = []
+    headers_detected = {}
+    unmapped_headers = []
 
-    bank = _detect_bank(text)
+    if tables:
+        # Use the first meaningful table
+        for table in tables:
+            if not table or len(table) < 2:
+                continue
+
+            header_idx, col_mapping = _detect_header_row(table, alias_map)
+            if header_idx >= 0 and len(col_mapping) >= 2:
+                # Detect bank from header text
+                header_text = " ".join(
+                    str(c) for c in table[header_idx] if c
+                ).upper()
+                bank = _detect_bank_from_text(header_text)
+
+                # Build headers_detected response
+                for col_idx, fn in col_mapping.items():
+                    if col_idx < len(table[header_idx]):
+                        headers_detected[fn] = str(table[header_idx][col_idx])
+                        # Track unmapped
+                        if fn.startswith("field_") or fn in (c.lower() for c in table[header_idx] if _match_alias(str(c), alias_map)[0] is None):
+                            pass
+
+                # Collect unmapped headers
+                for col_idx, cell in enumerate(table[header_idx]):
+                    cell_str = str(cell).strip() if cell else ""
+                    if cell_str and col_idx not in col_mapping:
+                        unmapped_headers.append(cell_str)
+
+                # Assemble rows
+                rows = _assemble_rows(table, header_idx, col_mapping)
+
+                if rows:
+                    break
+
+    # Fallback: text-based extraction if table extraction didn't find rows
+    if not rows:
+        logger.info("[Parser] Table extraction yielded no rows, falling back to text extraction")
+        text = extract_text_from_pdf(file_bytes)
+        bank = _detect_bank_from_text(text)
+        rows = _parse_rows_fallback(text)
+        headers_detected = {}
+        unmapped_headers = []
+    else:
+        # Still extract text for bank detection and raw_text
+        text = extract_text_from_pdf(file_bytes)
+        bank = _detect_bank_from_text(text)
 
     t3 = time.perf_counter()
-    logger.info(f"[Parser] bank detection: {(t3 - t2) * 1000:.0f}ms, bank={bank}")
 
-    rows = _parse_rows(text)
+    # Normalize rows
+    normalized = []
+    for r in rows:
+        normalized.append({
+            "date": _parse_date(r.get("date", "")),
+            "description": (r.get("description") or "").strip(),
+            "withdrawal": _clean_amount(r.get("withdrawal", "")),
+            "deposits": _clean_amount(r.get("deposits", "")),
+            "balance": _clean_amount(r.get("balance", "")),
+            "reference_no": (r.get("reference_no") or "").strip(),
+        })
 
     t4 = time.perf_counter()
-    logger.info(f"[Parser] row extraction: {(t4 - t3) * 1000:.0f}ms, rows={len(rows)}")
-    logger.info(f"[Parser] TOTAL: {(t4 - t0) * 1000:.0f}ms")
+    logger.info(
+        f"[Parser] table: {(t2-t1)*1000:.0f}ms, assemble: {(t3-t2)*1000:.0f}ms, "
+        f"normalize: {(t4-t3)*1000:.0f}ms, TOTAL: {(t4-t0)*1000:.0f}ms, "
+        f"bank={bank}, rows={len(normalized)}"
+    )
 
     return {
         "bank": bank,
-        "rows": rows,
-        "raw_text": text[:2000],
+        "rows": normalized,
+        "row_count": len(normalized),
+        "headers_detected": headers_detected,
+        "unmapped_headers": unmapped_headers,
+        "raw_text": text[:2000] if 'text' in dir() else "",
     }
 
 
-def _detect_bank(text: str) -> str:
+def _detect_bank_from_text(text: str) -> str:
     """Detect bank name from text for reporting only."""
-    upper = text.upper()
-    header = "\n".join(upper.splitlines()[:20])
-
+    upper = text.upper() if text else ""
     bank_keywords = {
         "Yes Bank": ["YES BANK", "YESBANK"],
         "HDFC": ["HDFC BANK"],
@@ -202,20 +561,20 @@ def _detect_bank(text: str) -> str:
     }
     for bank_name, keywords in bank_keywords.items():
         for kw in keywords:
-            if kw in header:
+            if kw in upper:
                 return bank_name
     return "Unknown"
 
 
-def _parse_rows(text: str) -> list:
+# ── Fallback text parser (no table structure) ───────────────────────────────
+
+def _parse_rows_fallback(text: str) -> list:
     """
-    Generic row extractor. Finds lines that start with a date pattern,
-    extracts date + description + amounts from each row.
-    No bank-specific logic.
+    Text-based fallback when table extraction fails.
+    Finds lines starting with date patterns and accumulates fields.
     """
     lines = text.split("\n")
 
-    # Date patterns to detect transaction rows
     date_patterns = [
         re.compile(r"^(\d{4}-\d{2}-\d{2})"),
         re.compile(r"^(\d{2}/\d{2}/\d{4})"),
@@ -223,11 +582,9 @@ def _parse_rows(text: str) -> list:
         re.compile(r"^(\d{2}-[A-Za-z]{3}-\d{4})"),
     ]
 
-    # Amount patterns
-    amt_single = re.compile(r"(-?[\d,]+\.\d{2})")
+    amt_pattern = re.compile(r"(-?[\d,]+\.\d{2})")
     amt_triple = re.compile(r"([\d,]+\.\d{2})\s+([\d,]+\.\d{2})\s+([\d,]+\.\d{2})")
 
-    # Keywords to skip (header/footer lines)
     skip_keywords = [
         "PAGE", "Statement", "Customer", "Account", "Branch",
         "IFSC", "MICR", "Customer ID", "Nomination", "Address",
@@ -242,12 +599,10 @@ def _parse_rows(text: str) -> list:
         if not line:
             continue
 
-        # Skip header/footer keywords (short lines only)
         if len(line) < 50:
             if any(kw.lower() in line.lower() for kw in skip_keywords):
                 continue
 
-        # Check if this line starts with a date
         date_val = None
         date_end = 0
         for pat in date_patterns:
@@ -258,10 +613,8 @@ def _parse_rows(text: str) -> list:
                 break
 
         if date_val:
-            # Save previous row
             if current_row and current_row.get("date"):
                 rows.append(current_row)
-            # Start new row
             rest = line[date_end:].strip()
             current_row = {
                 "date": _parse_date(date_val),
@@ -271,41 +624,34 @@ def _parse_rows(text: str) -> list:
                 "balance": "",
                 "reference_no": "",
             }
-            # Try to extract amounts from the rest of the line
-            _extract_amounts(current_row, rest, amt_single, amt_triple)
+            _extract_amounts(current_row, rest, amt_pattern, amt_triple)
         elif current_row:
-            # Continuation of previous row
-            _extract_amounts(current_row, line, amt_single, amt_triple)
+            _extract_amounts(current_row, line, amt_pattern, amt_triple)
 
-    # Save last row
     if current_row and current_row.get("date"):
         rows.append(current_row)
 
-    # Clean up descriptions
+    # Clean descriptions
     for r in rows:
         r["description"] = re.sub(r"\s+", " ", r["description"]).strip()
-        # Remove the trailing amounts from description if they were captured
         r["description"] = re.sub(r"\s*[\d,]+\.\d{2}.*$", "", r["description"]).strip()
 
     return rows
 
 
-def _extract_amounts(row: dict, text: str, amt_single, amt_triple):
-    """Extract withdrawal/deposit/balance amounts from a text string."""
-    # Try triple amount pattern first (withdrawal + deposit + balance on same line)
+def _extract_amounts(row: dict, text: str, amt_pattern, amt_triple):
+    """Extract amounts from text into row dict."""
     triple = amt_triple.search(text)
     if triple:
         row["withdrawal"] = triple.group(1)
         row["deposits"] = triple.group(2)
         row["balance"] = triple.group(3)
-        # Update description without the amounts
         desc_part = text[:triple.start()].strip()
         if desc_part and len(desc_part) < len(row.get("description", "")):
             row["description"] = desc_part
         return
 
-    # Try single/double amounts
-    amounts = amt_single.findall(text)
+    amounts = amt_pattern.findall(text)
     if len(amounts) == 1:
         if not row.get("balance"):
             row["balance"] = amounts[0]
@@ -317,42 +663,13 @@ def _extract_amounts(row: dict, text: str, amt_single, amt_triple):
         if len(amounts) >= 3 and not row.get("balance"):
             row["balance"] = amounts[2]
 
-    # Extract reference number (10+ digits)
     ref_match = re.search(r"(\d{10,})\s*$", text)
     if ref_match:
         row["reference_no"] = ref_match.group(1)
 
 
-# ── Main entry point (called by pdf_import.py) ──────────────────────────────
+# ── Main entry point ────────────────────────────────────────────────────────
 
-async def process_pdf_import(file_bytes: bytes, save: bool = False, password: str = "", fieldmap_rows: list = None):
-    """
-    Main entry point for PDF import. Extracts rows from a PDF.
-    If save=True, rows are inserted into master table via append_rows_to_master.
-    """
-    from import_helpers import append_rows_to_master
-
-    t_start = time.perf_counter()
-
-    try:
-        result = parse_pdf(file_bytes, password=password)
-    except RuntimeError:
-        raise
-    except Exception as e:
-        logger.error(f"[PDF] Parser failed: {e}")
-        raise RuntimeError(f"PDF parsing failed: {e}")
-
-    rows = result.get("rows", [])
-    bank = result.get("bank", "Unknown")
-    logger.info(f"[PDF] parse: bank={bank}, rows={len(rows)}")
-
-    inserted_count = 0
-    if save and rows:
-        from database import Database
-        async with Database.acquire() as conn:
-            fm = fieldmap_rows or []
-            inserted_count = await append_rows_to_master(conn, rows, fm)
-
-    t_total = (time.perf_counter() - t_start) * 1000
-    logger.info(f"[PDF] TOTAL: {t_total:.0f}ms")
-    return {"bank": bank, "rows": rows, "row_count": len(rows), "inserted": inserted_count}
+def _parse_sync(file_bytes: bytes, password: str = "", fieldmap_rows: list = None) -> dict:
+    """Sync wrapper for use with run_in_executor."""
+    return parse_pdf(file_bytes, password=password, fieldmap_rows=fieldmap_rows or [])
