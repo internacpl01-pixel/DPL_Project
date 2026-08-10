@@ -83,25 +83,20 @@ def _assemble_excel_rows(rows: list, header_idx: int, col_mapping: dict,
     """Assemble transaction rows from Excel table data.
     Row keys = fieldmap fieldnames. Column roles come from information_schema types.
     """
-    date_col = None
+    date_cols = []
     text_cols = set()
-    numeric_cols = set()
 
     for col_idx, fieldname in col_mapping.items():
         col_type = (live_col_types.get(fieldname) or "").lower()
         if col_type in ("date", "timestamp without time zone", "timestamp"):
-            date_col = col_idx
+            date_cols.append(col_idx)
         elif col_type in ("text", "character varying", "varchar"):
             text_cols.add(col_idx)
-        elif col_type in ("real", "double precision", "numeric", "integer", "bigint"):
-            numeric_cols.add(col_idx)
 
-    if date_col is None:
+    if not date_cols:
         for col_idx, fieldname in col_mapping.items():
-            fn_lower = fieldname.lower()
-            if fn_lower in ("date", "value_date", "entry_date", "tran_date", "txn_date"):
-                date_col = col_idx
-                break
+            if fieldname.lower() in ("date", "value_date", "entry_date", "tran_date", "txn_date"):
+                date_cols.append(col_idx)
 
     _FOOTER_KEYWORDS = {
         "total", "closing balance", "b/f", "c/f", "b/fwd", "c/fwd",
@@ -110,11 +105,9 @@ def _assemble_excel_rows(rows: list, header_idx: int, col_mapping: dict,
 
     result = []
     current_row = None
-    # Fieldmap fieldname of the anchor date column — not hardcoded "date"
-    date_fieldname = col_mapping.get(date_col) if date_col is not None else None
 
     def _row_started():
-        return current_row and date_fieldname and current_row.get(date_fieldname)
+        return current_row is not None
 
     for row_idx in range(header_idx + 1, len(rows)):
         row_cells = rows[row_idx]
@@ -125,9 +118,9 @@ def _assemble_excel_rows(rows: list, header_idx: int, col_mapping: dict,
         while len(row_cells) < len(rows[header_idx]):
             row_cells.append("")
 
-        # A row with a valid date in the anchor column is always a transaction —
+        # A row with a valid date in ANY anchor column is always a transaction —
         # even if its text matches a footer keyword (e.g. "B/F" opening-balance rows).
-        if date_col is not None and date_col < len(row_cells) and _looks_like_date(row_cells[date_col]):
+        if any(dc < len(row_cells) and _looks_like_date(row_cells[dc]) for dc in date_cols):
             if _row_started():
                 result.append(current_row)
 

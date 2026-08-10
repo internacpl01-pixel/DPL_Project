@@ -373,30 +373,24 @@ def _assemble_rows(table_rows: list, header_idx: int, col_mapping: dict,
     """
     # Determine column roles from live column types
     live_col_types = live_col_types or {}
-    date_col = None       # anchor column — starts a new row
+    date_cols = []        # anchor columns — a valid date in ANY starts a new row
     text_cols = set()     # text columns — receive continuation lines
-    numeric_cols = set()  # numeric columns — receive cleaned amounts
 
     for col_idx, fieldname in col_mapping.items():
         col_type = (live_col_types.get(fieldname) or "").lower()
         if col_type in ("date", "timestamp without time zone", "timestamp"):
-            date_col = col_idx
+            date_cols.append(col_idx)
         elif col_type in ("text", "character varying", "varchar"):
             text_cols.add(col_idx)
-        elif col_type in ("real", "double precision", "numeric", "integer", "bigint"):
-            numeric_cols.add(col_idx)
 
-    # Fallback: if no date column found by type, use name heuristics
-    if date_col is None:
+    # Fallback: if no date column found by type, use fieldname heuristics
+    if not date_cols:
         for col_idx, fieldname in col_mapping.items():
-            fn_lower = fieldname.lower()
-            if fn_lower in ("date", "value_date", "entry_date", "tran_date", "txn_date"):
-                date_col = col_idx
-                break
+            if fieldname.lower() in ("date", "value_date", "entry_date", "tran_date", "txn_date"):
+                date_cols.append(col_idx)
 
     rows = []
     current_row = None
-    date_fieldname = None  # the fieldmap fieldname for the date column
 
     for row_idx in range(header_idx + 1, len(table_rows)):
         row_cells = table_rows[row_idx]
@@ -405,10 +399,12 @@ def _assemble_rows(table_rows: list, header_idx: int, col_mapping: dict,
 
         row_cells = [str(c).strip() if c else "" for c in row_cells]
 
-        # A row with a valid date in the anchor column is always a transaction —
-        # even if its text matches a footer keyword (e.g. "B/F" opening-balance rows).
-        if date_col is not None and _has_valid_date(row_cells, date_col):
-            if current_row and date_fieldname and current_row.get(date_fieldname):
+        # A row with a valid date in ANY anchor column is always a transaction —
+        # even if its text matches a footer keyword (e.g. "B/F" opening-balance
+        # rows). Checking every date column tolerates cells lost to imperfect
+        # column-boundary detection.
+        if any(_has_valid_date(row_cells, dc) for dc in date_cols):
+            if current_row:
                 rows.append(current_row)
 
             current_row = {}
@@ -417,8 +413,6 @@ def _assemble_rows(table_rows: list, header_idx: int, col_mapping: dict,
                 if not fieldname or not cell:
                     continue
                 current_row[fieldname] = cell
-                if col_idx == date_col:
-                    date_fieldname = fieldname
 
         else:
             # Date-less rows: footer/summary rows (TOTAL, Page N, ...) end the
@@ -434,12 +428,12 @@ def _assemble_rows(table_rows: list, header_idx: int, col_mapping: dict,
                 if is_footer:
                     break
             if is_footer:
-                if current_row and date_fieldname and current_row.get(date_fieldname):
+                if current_row:
                     rows.append(current_row)
                     current_row = None
                 continue
 
-            if current_row and date_fieldname and current_row.get(date_fieldname):
+            if current_row:
                 # Continuation row: append to text columns only
                 for col_idx in text_cols:
                     if col_idx < len(row_cells) and row_cells[col_idx]:
@@ -451,7 +445,7 @@ def _assemble_rows(table_rows: list, header_idx: int, col_mapping: dict,
                                 current_row[fieldname] = row_cells[col_idx]
 
     # Save last row
-    if current_row and date_fieldname and current_row.get(date_fieldname):
+    if current_row:
         rows.append(current_row)
 
     return rows
@@ -564,29 +558,35 @@ def parse_pdf(file_bytes: bytes, password: str = "", fieldmap_rows: list = None,
     # Live column types (passed from pdf_import, used for data-type-driven roles)
     live_col_types = live_col_types or {}
 
-    # 1) Ruled-lines table extraction — processes ALL tables/pages
-    rows = []
-    headers_detected = {}
-    unmapped_headers = []
+    # Run BOTH table strategies and keep whichever assembles the most rows.
+    # Different statements defeat different strategies: ruled-lines fails when
+    # row separators aren't detectable (rows merge or vanish), text-lines fails
+    # when cells wrap oddly. Comparing results is layout-agnostic and generic.
+    candidates = []
+    for label, settings in (("lines", None), ("text", {"horizontal_strategy": "text"})):
+        tables = _extract_tables_from_pdf(file_bytes, settings)
+        if tables:
+            assembled = _assemble_from_tables(tables, alias_map, live_col_types)
+            candidates.append((label, assembled))
+            logger.info(f"[Parser] strategy={label}: {len(assembled[0])} rows")
 
-    tables = _extract_tables_from_pdf(file_bytes)
-    if tables:
-        rows, headers_detected, unmapped_headers = _assemble_from_tables(
-            tables, alias_map, live_col_types)
+    rows, headers_detected, unmapped_headers = [], {}, []
+    best_label = None
+    for label, (cand_rows, cand_hd, cand_um) in candidates:
+        # Prefer more rows; penalize candidates showing the merged-row signature
+        if _has_merged_rows(cand_rows):
+            continue
+        if len(cand_rows) > len(rows):
+            rows, headers_detected, unmapped_headers = cand_rows, cand_hd, cand_um
+            best_label = label
+    if not rows and candidates:
+        # Every candidate looked merged/empty — take the largest anyway
+        best_label, (rows, headers_detected, unmapped_headers) = max(
+            candidates, key=lambda c: len(c[1][0]))
+    if best_label:
+        logger.info(f"[Parser] selected strategy={best_label}, rows={len(rows)}")
 
-    # 2) Retry with text-line rows when the lines strategy merged multiple
-    #    transactions into one row (row separators not detectable) or found nothing.
-    if not rows or _has_merged_rows(rows):
-        text_tables = _extract_tables_from_pdf(
-            file_bytes, {"horizontal_strategy": "text"})
-        if text_tables:
-            rows2, hd2, um2 = _assemble_from_tables(
-                text_tables, alias_map, live_col_types)
-            if len(rows2) > len(rows):
-                logger.info(f"[Parser] text-strategy retry: {len(rows)} -> {len(rows2)} rows")
-                rows, headers_detected, unmapped_headers = rows2, hd2, um2
-
-    # 3) Word-coordinate clustering fallback
+    # Word-coordinate clustering fallback
     if not rows:
         coord_tables = _extract_table_by_coordinates(file_bytes)
         if coord_tables:
