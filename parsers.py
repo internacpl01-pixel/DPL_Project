@@ -101,7 +101,10 @@ def check_pdf_protected(file_bytes: bytes) -> bool:
 def decrypt_pdf(file_bytes: bytes, password: str) -> bytes:
     """Decrypt a password-protected PDF and return decrypted bytes using pypdf."""
     if not password:
-        raise ValueError("Password is required for encrypted PDF")
+        raise RuntimeError(
+            "ENCRYPTED: This PDF is password-protected. "
+            "Please provide the password to proceed."
+        )
 
     if not PYPDF_AVAILABLE:
         raise RuntimeError("pypdf is required for PDF decryption")
