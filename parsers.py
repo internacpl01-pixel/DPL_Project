@@ -23,19 +23,6 @@ try:
 except ImportError:
     PDFPLUMBER_AVAILABLE = False
 
-try:
-    from pdf2image import convert_from_path
-    from PIL import Image
-    PDF2IMAGE_AVAILABLE = True
-except ImportError:
-    PDF2IMAGE_AVAILABLE = False
-
-try:
-    import pytesseract
-    TESSERACT_AVAILABLE = True
-except ImportError:
-    TESSERACT_AVAILABLE = False
-
 
 # ── Bank detection ──────────────────────────────────────────────────────────
 
@@ -141,36 +128,26 @@ def decrypt_pdf(file_bytes: bytes, password: str) -> bytes:
         raise RuntimeError(f"Failed to decrypt PDF: {e}")
 
 
-def has_sufficient_text(text: str, min_chars: int = 200) -> bool:
-    """Return True if the PDF has enough text to be considered text-based."""
-    cleaned = re.sub(r"\s+", "", text)
-    return len(cleaned) >= min_chars
+def extract_text_from_pdf(file_bytes: bytes) -> str:
+    """Extract all text from a PDF using pdfplumber."""
+    if not PDFPLUMBER_AVAILABLE:
+        raise RuntimeError("pdfplumber is not installed")
 
-
-def extract_text_with_ocr(file_bytes: bytes) -> str:
-    """Fallback: convert PDF pages to images and run OCR."""
-    if not PDF2IMAGE_AVAILABLE or not TESSERACT_AVAILABLE:
-        raise RuntimeError("OCR dependencies (pdf2image + pytesseract) are not installed")
-
-    text_parts = []
-
-    import tempfile, os
-    tmp = tempfile.NamedTemporaryFile(suffix=".pdf", delete=False)
-    tmp.write(file_bytes)
-    tmp.close()
-
+    pages_text = []
     try:
-        images = convert_from_path(tmp.name, dpi=200)
-        for img in images:
-            txt = pytesseract.image_to_string(img)
-            text_parts.append(txt)
-    finally:
-        os.unlink(tmp.name)
+        with pdfplumber.open(io.BytesIO(file_bytes)) as pdf:
+            for page in pdf.pages:
+                txt = page.extract_text()
+                if txt:
+                    pages_text.append(txt)
+    except Exception as e:
+        err_msg = str(e).lower()
+        if "password" in err_msg or "encrypt" in err_msg or "decrypt" in err_msg:
+            raise RuntimeError("ENCRYPTED: This PDF is password-protected. Please provide the password.")
+        raise
 
-    return "\n".join(text_parts)
+    return "\n".join(pages_text)
 
-
-# ── Row normalization helpers ───────────────────────────────────────────────
 
 def _clean_amount(val: str) -> str:
     """Strip currency symbols, commas, and whitespace from an amount string."""
@@ -1232,44 +1209,17 @@ def parse_pdf(file_bytes: bytes, password: str = "") -> dict:
             )
         file_bytes = decrypt_pdf(file_bytes, password)
 
-    text = ""
-    use_ocr = False
-
-    try:
-        text = extract_text_from_pdf(file_bytes)
-    except Exception as e:
-        logger.warning(f"pdfplumber extraction failed: {e}")
-        use_ocr = True
-
     t1 = time.perf_counter()
-    logger.info(f"[Parser] text extraction: {(t1-t0)*1000:.0f}ms, chars={len(text)}")
 
-    if not has_sufficient_text(text):
-        logger.info("Insufficient text extracted, attempting OCR...")
-        use_ocr = True
-
-    if use_ocr:
-        try:
-            text = extract_text_with_ocr(file_bytes)
-        except Exception as e:
-            logger.warning(f"OCR fallback also failed: {e}")
-            if text.strip():
-                # pdfplumber extracted some text — continue with it
-                logger.info("Proceeding with text extracted by pdfplumber")
-            else:
-                raise RuntimeError(
-                    "Could not extract text from this PDF. It may be a scanned document "
-                    "and OCR dependencies (pytesseract, pdf2image, tesseract-ocr) are not installed. "
-                    "Please install tesseract-ocr on the server or upload a text-based PDF."
-                )
+    text = extract_text_from_pdf(file_bytes)
 
     t2 = time.perf_counter()
-    logger.info(f"[Parser] after OCR (if needed): {(t2-t1)*1000:.0f}ms, chars={len(text)}")
+    logger.info(f"[Parser] text extraction: {(t2-t1)*1000:.0f}ms, chars={len(text)}")
 
     if not text.strip():
         raise RuntimeError(
             "PDF appears to be empty or could not be read. "
-            "If it is a scanned document, ensure pytesseract and tesseract-ocr are installed."
+            "Please upload a valid text-based PDF."
         )
 
     bank = detect_bank(text)
