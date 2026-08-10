@@ -604,6 +604,103 @@ def _parse_yesbank(text: str) -> list:
     return _parse_yesbank_coordinate_from_text(text)
 
 
+def _parse_yesbank_text_fallback(text: str) -> list:
+    """Text-based YES Bank fallback parser for when coordinate extraction fails."""
+    rows = []
+    lines = text.split("\n")
+
+    skip_keywords = ["YES BANK", "PAGE", "Statement", "Customer", "Account",
+                     "Branch", "IFSC", "MICR", "Customer ID", "Nomination",
+                     "Account Type", "Address", "Date:", "Generated",
+                     "transaction", "date", "value", "description",
+                     "reference", "number", "withdrawals", "deposits",
+                     "running", "balance", "particulars", "chq",
+                     "srno", "no", "type", "instrument"]
+
+    amt_pattern = re.compile(r"([\d,]+\.\d{2})\s+([\d,]+\.\d{2})\s+([\d,]+\.\d{2})")
+
+    current_date = ""
+    current_desc_parts = []
+    current_withdrawal = ""
+    current_deposit = ""
+    current_balance = ""
+    current_ref = ""
+
+    i = 0
+    while i < len(lines):
+        line = lines[i].strip()
+        if not line:
+            i += 1
+            continue
+
+        if any(kw.lower() in line.lower() for kw in skip_keywords):
+            if len(line) < 30:
+                i += 1
+                continue
+
+        date_match = re.match(r"^(\d{4}-\d{2}-\d{2})", line)
+        if not date_match:
+            date_match = re.match(r"^(\d{2}-\d{2}-\d{4})", line)
+        if not date_match:
+            date_match = re.match(r"^(\d{2}/\d{2}/\d{4})", line)
+
+        if date_match:
+            if current_date and current_desc_parts:
+                rows.append({
+                    "date": current_date,
+                    "description": " ".join(current_desc_parts).strip(),
+                    "withdrawal": current_withdrawal,
+                    "deposits": current_deposit,
+                    "balance": current_balance,
+                    "reference_no": current_ref,
+                })
+
+            current_date = _parse_date(date_match.group(1))
+            rest = line[date_match.end():].strip()
+            current_desc_parts = []
+            current_withdrawal = ""
+            current_deposit = ""
+            current_balance = ""
+            current_ref = ""
+
+            amt_match = amt_pattern.search(rest)
+            if amt_match:
+                current_withdrawal = amt_match.group(1)
+                current_deposit = amt_match.group(2)
+                current_balance = amt_match.group(3)
+                desc_part = rest[:amt_match.start()].strip()
+                current_desc_parts = [desc_part] if desc_part else []
+            else:
+                current_desc_parts = [rest] if rest else []
+        else:
+            if current_date:
+                amt_match = amt_pattern.search(line)
+                if amt_match and not current_balance:
+                    current_withdrawal = amt_match.group(1)
+                    current_deposit = amt_match.group(2)
+                    current_balance = amt_match.group(3)
+                    desc_extra = line[:amt_match.start()].strip()
+                    if desc_extra:
+                        current_desc_parts.append(desc_extra)
+                else:
+                    if not any(kw.lower() in line.lower() for kw in skip_keywords):
+                        current_desc_parts.append(line)
+
+        i += 1
+
+    if current_date and current_desc_parts:
+        rows.append({
+            "date": current_date,
+            "description": " ".join(current_desc_parts).strip(),
+            "withdrawal": current_withdrawal,
+            "deposits": current_deposit,
+            "balance": current_balance,
+            "reference_no": current_ref,
+        })
+
+    return rows
+
+
 def _classify_col(x0: float) -> str:
     """Classify a word into a YES Bank table column based on x position."""
     if x0 < 80:
@@ -1085,9 +1182,16 @@ def parse_pdf(file_bytes: bytes) -> dict:
         try:
             text = extract_text_with_ocr(file_bytes)
         except Exception as e:
-            raise RuntimeError(
-                f"Could not extract text from PDF via pdfplumber or OCR: {e}"
-            )
+            logger.warning(f"OCR fallback also failed: {e}")
+            if text.strip():
+                # pdfplumber extracted some text — continue with it
+                logger.info("Proceeding with text extracted by pdfplumber")
+            else:
+                raise RuntimeError(
+                    "Could not extract text from this PDF. It may be a scanned document "
+                    "and OCR dependencies (pytesseract, pdf2image, tesseract-ocr) are not installed. "
+                    "Please install tesseract-ocr on the server or upload a text-based PDF."
+                )
 
     t2 = time.perf_counter()
     logger.info(f"[Parser] after OCR (if needed): {(t2-t1)*1000:.0f}ms, chars={len(text)}")
@@ -1107,6 +1211,9 @@ def parse_pdf(file_bytes: bytes) -> dict:
     try:
         if bank == BANK_YES:
             rows = _parse_yesbank_coords(file_bytes)
+            if not rows and text.strip():
+                logger.info("Coordinate parser returned 0 rows, trying text fallback")
+                rows = _parse_yesbank_text_fallback(text)
         else:
             parser_fn = _PARSERS.get(bank, _parse_generic)
             rows = parser_fn(text)
