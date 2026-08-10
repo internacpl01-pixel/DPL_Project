@@ -81,17 +81,23 @@ def extract_text_from_pdf(file_bytes: bytes) -> str:
         raise RuntimeError("pdfplumber is not installed")
 
     pages_text = []
-    with pdfplumber.open(io.BytesIO(file_bytes)) as pdf:
-        for page in pdf.pages:
-            txt = page.extract_text()
-            if txt:
-                pages_text.append(txt)
+    try:
+        with pdfplumber.open(io.BytesIO(file_bytes)) as pdf:
+            for page in pdf.pages:
+                txt = page.extract_text()
+                if txt:
+                    pages_text.append(txt)
+    except Exception as e:
+        err_msg = str(e).lower()
+        if "password" in err_msg or "encrypt" in err_msg or "decrypt" in err_msg:
+            raise RuntimeError("ENCRYPTED: This PDF is password-protected. Please provide the password.")
+        raise
 
     return "\n".join(pages_text)
 
 
 def check_pdf_protected(file_bytes: bytes) -> bool:
-    """Check if a PDF is password-protected."""
+    """Check if a PDF is password-protected using pypdf."""
     if PYPDF_AVAILABLE:
         try:
             reader = PdfReader(io.BytesIO(file_bytes))
@@ -115,18 +121,23 @@ def decrypt_pdf(file_bytes: bytes, password: str) -> bytes:
 
     try:
         reader = PdfReader(io.BytesIO(file_bytes))
-        reader.decrypt(password)
-        if reader.is_encrypted:
+        result = reader.decrypt(password)
+        if result == 0:
             raise RuntimeError("Incorrect password. Please try again.")
+        # Verify we can actually read content
+        try:
+            _ = reader.pages[0].extract_text()
+        except Exception:
+            raise RuntimeError("Incorrect password or corrupted PDF. Please try again.")
         out = io.BytesIO()
         writer = PdfWriter()
         for page in reader.pages:
             writer.add_page(page)
         writer.write(out)
         return out.getvalue()
+    except RuntimeError:
+        raise
     except Exception as e:
-        if "incorrect" in str(e).lower() or "password" in str(e).lower():
-            raise RuntimeError("Incorrect password. Please try again.")
         raise RuntimeError(f"Failed to decrypt PDF: {e}")
 
 
