@@ -67,7 +67,8 @@ def decrypt_pdf(file_bytes: bytes, password: str) -> bytes:
         raise RuntimeError(f"Failed to decrypt PDF: {e}")
 
 
-def extract_text_from_pdf(file_bytes: bytes) -> str:
+def _extract_pages_text(file_bytes: bytes) -> list:
+    """Extract text per page. Returns a list of page-text strings."""
     if not PDFPLUMBER_AVAILABLE:
         raise RuntimeError("pdfplumber is not installed")
     pages_text = []
@@ -82,7 +83,11 @@ def extract_text_from_pdf(file_bytes: bytes) -> str:
         if "password" in err_msg or "encrypt" in err_msg or "decrypt" in err_msg:
             raise RuntimeError("ENCRYPTED: This PDF is password-protected. Please provide the password.")
         raise
-    return "\n".join(pages_text)
+    return pages_text
+
+
+def extract_text_from_pdf(file_bytes: bytes) -> str:
+    return "\n".join(_extract_pages_text(file_bytes))
 
 
 # ── Helpers ─────────────────────────────────────────────────────────────────
@@ -207,10 +212,13 @@ def _match_alias(header: str, alias_map: dict) -> tuple:
 
 # ── Table extraction ────────────────────────────────────────────────────────
 
-def _extract_tables_from_pdf(file_bytes: bytes) -> list:
+def _extract_tables_from_pdf(file_bytes: bytes, table_settings: dict = None) -> list:
     """
     Extract tables from PDF using pdfplumber.
     Returns list of tables, each table is a list of rows (each row is a list of cell strings).
+
+    table_settings is passed through to pdfplumber — e.g. {"horizontal_strategy": "text"}
+    splits rows by text lines when the PDF's row-separator lines aren't detectable.
     """
     if not PDFPLUMBER_AVAILABLE:
         return []
@@ -218,7 +226,7 @@ def _extract_tables_from_pdf(file_bytes: bytes) -> list:
     try:
         with pdfplumber.open(io.BytesIO(file_bytes)) as pdf:
             for page in pdf.pages:
-                page_tables = page.extract_tables()
+                page_tables = page.extract_tables(table_settings)
                 if page_tables:
                     tables.extend(page_tables)
     except Exception as e:
@@ -397,24 +405,8 @@ def _assemble_rows(table_rows: list, header_idx: int, col_mapping: dict,
 
         row_cells = [str(c).strip() if c else "" for c in row_cells]
 
-        # Check for footer: text columns contain footer keywords
-        is_footer = False
-        for col_idx in text_cols:
-            if col_idx < len(row_cells):
-                cell_lower = row_cells[col_idx].lower()
-                for kw in _FOOTER_KEYWORDS:
-                    if kw == cell_lower or cell_lower.startswith(kw):
-                        is_footer = True
-                        break
-            if is_footer:
-                break
-        if is_footer:
-            if current_row and date_fieldname and current_row.get(date_fieldname):
-                rows.append(current_row)
-                current_row = None
-            continue
-
-        # Check if this row starts with a valid date (anchor column)
+        # A row with a valid date in the anchor column is always a transaction —
+        # even if its text matches a footer keyword (e.g. "B/F" opening-balance rows).
         if date_col is not None and _has_valid_date(row_cells, date_col):
             if current_row and date_fieldname and current_row.get(date_fieldname):
                 rows.append(current_row)
@@ -428,22 +420,102 @@ def _assemble_rows(table_rows: list, header_idx: int, col_mapping: dict,
                 if col_idx == date_col:
                     date_fieldname = fieldname
 
-        elif current_row and date_fieldname and current_row.get(date_fieldname):
-            # Continuation row: append to text columns only
+        else:
+            # Date-less rows: footer/summary rows (TOTAL, Page N, ...) end the
+            # current transaction and must not leak into its description.
+            is_footer = False
             for col_idx in text_cols:
-                if col_idx < len(row_cells) and row_cells[col_idx]:
-                    fieldname = col_mapping.get(col_idx)
-                    if fieldname:
-                        if fieldname in current_row and current_row[fieldname]:
-                            current_row[fieldname] += " " + row_cells[col_idx]
-                        else:
-                            current_row[fieldname] = row_cells[col_idx]
+                if col_idx < len(row_cells):
+                    cell_lower = row_cells[col_idx].lower()
+                    for kw in _FOOTER_KEYWORDS:
+                        if kw == cell_lower or cell_lower.startswith(kw):
+                            is_footer = True
+                            break
+                if is_footer:
+                    break
+            if is_footer:
+                if current_row and date_fieldname and current_row.get(date_fieldname):
+                    rows.append(current_row)
+                    current_row = None
+                continue
+
+            if current_row and date_fieldname and current_row.get(date_fieldname):
+                # Continuation row: append to text columns only
+                for col_idx in text_cols:
+                    if col_idx < len(row_cells) and row_cells[col_idx]:
+                        fieldname = col_mapping.get(col_idx)
+                        if fieldname:
+                            if fieldname in current_row and current_row[fieldname]:
+                                current_row[fieldname] += " " + row_cells[col_idx]
+                            else:
+                                current_row[fieldname] = row_cells[col_idx]
 
     # Save last row
     if current_row and date_fieldname and current_row.get(date_fieldname):
         rows.append(current_row)
 
     return rows
+
+
+# ── Multi-table assembly ────────────────────────────────────────────────────
+
+_DATE_TOKEN_RE = re.compile(
+    r"\d{4}-\d{2}-\d{2}|\d{1,2}[/\-]\d{1,2}[/\-]\d{2,4}|\d{1,2}-[A-Za-z]{3,9}-\d{2,4}"
+)
+
+
+def _has_merged_rows(rows: list) -> bool:
+    """
+    Detect pdfplumber's 'merged row' failure: when row-separator lines aren't
+    found, all transactions collapse into one giant row whose cells hold many
+    newline-joined values (e.g. the date cell contains every date in the table).
+    """
+    for r in rows:
+        for v in r.values():
+            s = str(v)
+            if "\n" in s and len(_DATE_TOKEN_RE.findall(s)) >= 2:
+                return True
+    return False
+
+
+def _assemble_from_tables(tables: list, alias_map: dict, live_col_types: dict) -> tuple:
+    """
+    Assemble rows from ALL tables (all pages), not just the first.
+    Tables with a detectable header are parsed with their own column mapping;
+    header-less tables (continuation pages) reuse the previous table's mapping
+    when the column count matches.
+
+    Returns (rows, headers_detected, unmapped_headers).
+    """
+    all_rows = []
+    headers_detected = {}
+    unmapped_headers = []
+    last_mapping = None
+    last_ncols = 0
+
+    for table in tables:
+        if not table:
+            continue
+
+        header_idx, col_mapping = _detect_header_row(table, alias_map)
+        if header_idx >= 0 and col_mapping and len(col_mapping) >= 2:
+            header_row = table[header_idx]
+            for col_idx, fn in col_mapping.items():
+                if col_idx < len(header_row) and fn not in headers_detected:
+                    headers_detected[fn] = str(header_row[col_idx]).strip()
+            for col_idx, cell in enumerate(header_row):
+                cell_str = str(cell).strip() if cell else ""
+                if cell_str and col_idx not in col_mapping and cell_str not in unmapped_headers:
+                    unmapped_headers.append(cell_str)
+
+            all_rows.extend(_assemble_rows(table, header_idx, col_mapping, live_col_types))
+            last_mapping = col_mapping
+            last_ncols = len(header_row)
+        elif last_mapping and len(table[0]) == last_ncols:
+            # Continuation page without a repeated header — reuse previous mapping
+            all_rows.extend(_assemble_rows(table, -1, last_mapping, live_col_types))
+
+    return all_rows, headers_detected, unmapped_headers
 
 
 # ── Generic parser ──────────────────────────────────────────────────────────
@@ -463,10 +535,9 @@ def parse_pdf(file_bytes: bytes, password: str = "", fieldmap_rows: list = None,
 
     Returns:
         {
-            "bank": str,
-            "rows": [{"date", "description", "withdrawal", "deposits", "balance", "reference_no"}, ...],
+            "rows": [{<fieldmap fieldname>: value, ...}, ...],
             "row_count": int,
-            "headers_detected": {col_name: fieldname, ...},
+            "headers_detected": {fieldname: header_text, ...},
             "unmapped_headers": [header_text, ...],
             "raw_text": str
         }
@@ -493,63 +564,45 @@ def parse_pdf(file_bytes: bytes, password: str = "", fieldmap_rows: list = None,
     # Live column types (passed from pdf_import, used for data-type-driven roles)
     live_col_types = live_col_types or {}
 
-    # Try table extraction first (ruled lines)
-    tables = _extract_tables_from_pdf(file_bytes)
-
-    # Fallback: word-coordinate clustering (PDFs without ruled lines)
-    if not tables:
-        tables = _extract_table_by_coordinates(file_bytes)
-
-    t2 = time.perf_counter()
-
-    bank = "Unknown"
+    # 1) Ruled-lines table extraction — processes ALL tables/pages
     rows = []
     headers_detected = {}
     unmapped_headers = []
 
+    tables = _extract_tables_from_pdf(file_bytes)
     if tables:
-        # Use the first meaningful table
-        for table in tables:
-            if not table or len(table) < 2:
-                continue
+        rows, headers_detected, unmapped_headers = _assemble_from_tables(
+            tables, alias_map, live_col_types)
 
-            header_idx, col_mapping = _detect_header_row(table, alias_map)
-            if header_idx >= 0 and len(col_mapping) >= 2:
-                # Detect bank from header text
-                header_text = " ".join(
-                    str(c) for c in table[header_idx] if c
-                ).upper()
-                bank = _detect_bank_from_text(header_text)
+    # 2) Retry with text-line rows when the lines strategy merged multiple
+    #    transactions into one row (row separators not detectable) or found nothing.
+    if not rows or _has_merged_rows(rows):
+        text_tables = _extract_tables_from_pdf(
+            file_bytes, {"horizontal_strategy": "text"})
+        if text_tables:
+            rows2, hd2, um2 = _assemble_from_tables(
+                text_tables, alias_map, live_col_types)
+            if len(rows2) > len(rows):
+                logger.info(f"[Parser] text-strategy retry: {len(rows)} -> {len(rows2)} rows")
+                rows, headers_detected, unmapped_headers = rows2, hd2, um2
 
-                # Build headers_detected response
-                for col_idx, fn in col_mapping.items():
-                    if col_idx < len(table[header_idx]):
-                        headers_detected[fn] = str(table[header_idx][col_idx])
+    # 3) Word-coordinate clustering fallback
+    if not rows:
+        coord_tables = _extract_table_by_coordinates(file_bytes)
+        if coord_tables:
+            rows, headers_detected, unmapped_headers = _assemble_from_tables(
+                coord_tables, alias_map, live_col_types)
 
-                # Collect unmapped headers
-                for col_idx, cell in enumerate(table[header_idx]):
-                    cell_str = str(cell).strip() if cell else ""
-                    if cell_str and col_idx not in col_mapping:
-                        unmapped_headers.append(cell_str)
+    t2 = time.perf_counter()
 
-                # Assemble rows (with live column types for data-type-driven roles)
-                rows = _assemble_rows(table, header_idx, col_mapping, live_col_types)
+    text = extract_text_from_pdf(file_bytes)
 
-                if rows:
-                    break
-
-    # Fallback: text-based extraction if table extraction didn't find rows
+    # 4) Last resort: text-based row parsing
     if not rows:
         logger.info("[Parser] Table extraction yielded no rows, falling back to text extraction")
-        text = extract_text_from_pdf(file_bytes)
-        bank = _detect_bank_from_text(text)
         rows = _parse_rows_fallback(text)
         headers_detected = {}
         unmapped_headers = []
-    else:
-        # Still extract text for bank detection and raw_text
-        text = extract_text_from_pdf(file_bytes)
-        bank = _detect_bank_from_text(text)
 
     t3 = time.perf_counter()
 
@@ -574,21 +627,25 @@ def parse_pdf(file_bytes: bytes, password: str = "", fieldmap_rows: list = None,
             # (works for default columns like "date" which exists in schema directly)
             canonical_to_master[parser_key] = parser_key
 
-    # Normalize rows: coerce types from live_col_types (not hardcoded names)
+    # Normalize rows: coerce types from live_col_types (not hardcoded names).
+    # Fallback-parser rows use concept keys ("description", ...) — rename them
+    # to master column names first; table rows already carry fieldmap fieldnames.
     normalized = []
     for r in rows:
         new_row = {}
         for key, val in r.items():
             if val is None or val == "":
                 continue
+            if key not in live_col_types:
+                key = canonical_to_master.get(key, key)
             col_type = (live_col_types.get(key) or "").lower()
             if col_type in ("date", "timestamp without time zone", "timestamp"):
                 new_row[key] = _parse_date(val)
             elif col_type in ("real", "double precision", "numeric", "integer", "bigint"):
-                cleaned = _clean_amount(val)
-                new_row[key] = cleaned
+                new_row[key] = _clean_amount(val)
             else:
-                new_row[key] = str(val).strip()
+                # Collapse newlines from multi-line PDF cells into single spaces
+                new_row[key] = re.sub(r"\s+", " ", str(val)).strip()
         if new_row:
             normalized.append(new_row)
 
@@ -596,36 +653,18 @@ def parse_pdf(file_bytes: bytes, password: str = "", fieldmap_rows: list = None,
     logger.info(
         f"[Parser] table: {(t2-t1)*1000:.0f}ms, assemble: {(t3-t2)*1000:.0f}ms, "
         f"normalize: {(t4-t3)*1000:.0f}ms, TOTAL: {(t4-t0)*1000:.0f}ms, "
-        f"bank={bank}, rows={len(normalized)}"
+        f"rows={len(normalized)}"
     )
 
     return {
-        "bank": bank,
         "rows": normalized,
         "row_count": len(normalized),
         "headers_detected": headers_detected,
         "unmapped_headers": unmapped_headers,
-        "raw_text": text[:2000] if 'text' in dir() else "",
+        "raw_text": text[:2000],
     }
 
 
-def _detect_bank_from_text(text: str) -> str:
-    """Detect bank name from text for reporting only."""
-    upper = text.upper() if text else ""
-    bank_keywords = {
-        "Yes Bank": ["YES BANK", "YESBANK"],
-        "HDFC": ["HDFC BANK"],
-        "ICICI": ["ICICI BANK"],
-        "Axis": ["AXIS BANK"],
-        "Kotak": ["KOTAK BANK", "KOTAK MAHINDRA"],
-        "SBI": ["STATE BANK OF INDIA"],
-        "Bank of Maharashtra": ["BANK OF MAHARASHTRA", "MAHARASHTRA BANK"],
-    }
-    for bank_name, keywords in bank_keywords.items():
-        for kw in keywords:
-            if kw in upper:
-                return bank_name
-    return "Unknown"
 
 
 # ── Fallback text parser (no table structure) ───────────────────────────────

@@ -110,6 +110,11 @@ def _assemble_excel_rows(rows: list, header_idx: int, col_mapping: dict,
 
     result = []
     current_row = None
+    # Fieldmap fieldname of the anchor date column — not hardcoded "date"
+    date_fieldname = col_mapping.get(date_col) if date_col is not None else None
+
+    def _row_started():
+        return current_row and date_fieldname and current_row.get(date_fieldname)
 
     for row_idx in range(header_idx + 1, len(rows)):
         row_cells = rows[row_idx]
@@ -120,24 +125,10 @@ def _assemble_excel_rows(rows: list, header_idx: int, col_mapping: dict,
         while len(row_cells) < len(rows[header_idx]):
             row_cells.append("")
 
-        is_footer = False
-        for col_idx in text_cols:
-            if col_idx < len(row_cells):
-                cell_lower = row_cells[col_idx].lower()
-                for kw in _FOOTER_KEYWORDS:
-                    if kw == cell_lower or cell_lower.startswith(kw):
-                        is_footer = True
-                        break
-            if is_footer:
-                break
-        if is_footer:
-            if current_row and current_row.get("date"):
-                result.append(current_row)
-                current_row = None
-            continue
-
-        if date_col is not None and _looks_like_date(row_cells[date_col]):
-            if current_row and current_row.get("date"):
+        # A row with a valid date in the anchor column is always a transaction —
+        # even if its text matches a footer keyword (e.g. "B/F" opening-balance rows).
+        if date_col is not None and date_col < len(row_cells) and _looks_like_date(row_cells[date_col]):
+            if _row_started():
                 result.append(current_row)
 
             current_row = {}
@@ -147,17 +138,36 @@ def _assemble_excel_rows(rows: list, header_idx: int, col_mapping: dict,
                     continue
                 current_row[fieldname] = cell
 
-        elif current_row and current_row.get("date"):
+        else:
+            # Date-less rows: footer/summary rows end the current transaction
+            # and must not leak into its description.
+            is_footer = False
             for col_idx in text_cols:
-                if col_idx < len(row_cells) and row_cells[col_idx]:
-                    fieldname = col_mapping.get(col_idx)
-                    if fieldname:
-                        if fieldname in current_row and current_row[fieldname]:
-                            current_row[fieldname] += " " + row_cells[col_idx]
-                        else:
-                            current_row[fieldname] = row_cells[col_idx]
+                if col_idx < len(row_cells):
+                    cell_lower = row_cells[col_idx].lower()
+                    for kw in _FOOTER_KEYWORDS:
+                        if kw == cell_lower or cell_lower.startswith(kw):
+                            is_footer = True
+                            break
+                if is_footer:
+                    break
+            if is_footer:
+                if _row_started():
+                    result.append(current_row)
+                    current_row = None
+                continue
 
-    if current_row and current_row.get("date"):
+            if _row_started():
+                for col_idx in text_cols:
+                    if col_idx < len(row_cells) and row_cells[col_idx]:
+                        fieldname = col_mapping.get(col_idx)
+                        if fieldname:
+                            if fieldname in current_row and current_row[fieldname]:
+                                current_row[fieldname] += " " + row_cells[col_idx]
+                            else:
+                                current_row[fieldname] = row_cells[col_idx]
+
+    if _row_started():
         result.append(current_row)
 
     return result
