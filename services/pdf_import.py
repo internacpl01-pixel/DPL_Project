@@ -9,14 +9,14 @@ from database import Database
 logger = logging.getLogger(__name__)
 
 
-async def process_pdf_import(file_bytes: bytes, save: bool = False):
+async def process_pdf_import(file_bytes: bytes, save: bool = False, password: str = ""):
     t_start = time.perf_counter()
 
     loop = asyncio.get_running_loop()
     t0 = time.perf_counter()
     try:
         result = await asyncio.wait_for(
-            loop.run_in_executor(None, _parse_sync, file_bytes),
+            loop.run_in_executor(None, _parse_sync, file_bytes, password),
             timeout=180.0,
         )
     except asyncio.TimeoutError:
@@ -44,6 +44,6 @@ async def process_pdf_import(file_bytes: bytes, save: bool = False):
     return {"bank": bank, "rows": rows, "row_count": len(rows), "inserted": inserted_count}
 
 
-def _parse_sync(file_bytes: bytes) -> dict:
+def _parse_sync(file_bytes: bytes, password: str = "") -> dict:
     from parsers import parse_pdf
-    return parse_pdf(file_bytes)
+    return parse_pdf(file_bytes, password=password)

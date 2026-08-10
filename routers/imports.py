@@ -12,6 +12,7 @@ logger = logging.getLogger(__name__)
 @router.post("/import/pdf")
 async def import_pdf(
     file: UploadFile = File(...),
+    password: str = Form(""),
     save: bool = Form(False),
     current_user: dict = Depends(get_current_user),
 ):
@@ -31,7 +32,7 @@ async def import_pdf(
         raise HTTPException(status_code=status.HTTP_413_REQUEST_ENTITY_TOO_LARGE, detail="File too large (max 25 MB)")
 
     try:
-        result = await process_pdf_import(file_bytes, save=save)
+        result = await process_pdf_import(file_bytes, save=save, password=password)
     except RuntimeError as e:
         logger.error(f"PDF parse failed: {e}")
         raise HTTPException(status_code=status.HTTP_422_UNPROCESSABLE_ENTITY, detail=str(e))

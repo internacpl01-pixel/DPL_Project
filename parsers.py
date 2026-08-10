@@ -12,6 +12,18 @@ from collections import defaultdict
 logger = logging.getLogger(__name__)
 
 try:
+    from pypdf import PdfReader
+    PYPDF_AVAILABLE = True
+except ImportError:
+    PYPDF_AVAILABLE = False
+
+try:
+    import pikepdf
+    PIKEPDF_AVAILABLE = True
+except ImportError:
+    PIKEPDF_AVAILABLE = False
+
+try:
     import pdfplumber
     PDFPLUMBER_AVAILABLE = True
 except ImportError:
@@ -82,6 +94,60 @@ def extract_text_from_pdf(file_bytes: bytes) -> str:
                 pages_text.append(txt)
 
     return "\n".join(pages_text)
+
+
+def check_pdf_protected(file_bytes: bytes) -> bool:
+    """Check if a PDF is password-protected."""
+    if PYPDF_AVAILABLE:
+        try:
+            reader = PdfReader(io.BytesIO(file_bytes))
+            return reader.is_encrypted
+        except Exception:
+            pass
+    # Fallback: check for encryption in raw PDF header
+    header = file_bytes[:20].lower()
+    if b"encrypt" in header or b"/filter" in header:
+        return True
+    return False
+
+
+def decrypt_pdf(file_bytes: bytes, password: str) -> bytes:
+    """Decrypt a password-protected PDF and return decrypted bytes."""
+    if not password:
+        raise ValueError("Password is required for encrypted PDF")
+
+    if PIKEPDF_AVAILABLE:
+        try:
+            import io
+            with pikepdf.open(io.BytesIO(file_bytes), password=password) as pdf:
+                out = io.BytesIO()
+                pdf.save(out)
+                return out.getvalue()
+        except pikepdf.PasswordError:
+            raise RuntimeError("Incorrect password. Please try again.")
+        except Exception as e:
+            raise RuntimeError(f"Failed to decrypt PDF: {e}")
+
+    if PYPDF_AVAILABLE:
+        try:
+            reader = PdfReader(io.BytesIO(file_bytes))
+            reader.decrypt(password)
+            if reader.is_encrypted:
+                raise RuntimeError("Incorrect password. Please try again.")
+            out = io.BytesIO()
+            writer = __import__("pypdf").PdfWriter()
+            for page in reader.pages:
+                writer.add_page(page)
+            writer.write(out)
+            return out.getvalue()
+        except __import__("pypdf").PasswordError:
+            raise RuntimeError("Incorrect password. Please try again.")
+        except Exception as e:
+            raise RuntimeError(f"Failed to decrypt PDF: {e}")
+
+    raise RuntimeError(
+        "No PDF decryption library available. Install pypdf or pikepdf."
+    )
 
 
 def has_sufficient_text(text: str, min_chars: int = 200) -> bool:
@@ -1144,9 +1210,13 @@ _PARSERS = {
 }
 
 
-def parse_pdf(file_bytes: bytes) -> dict:
+def parse_pdf(file_bytes: bytes, password: str = "") -> dict:
     """
     Parse a PDF bank statement and return normalized rows.
+
+    Args:
+        file_bytes: raw PDF bytes
+        password: optional password for encrypted PDFs
 
     Returns:
         {
@@ -1161,6 +1231,15 @@ def parse_pdf(file_bytes: bytes) -> dict:
         )
 
     t0 = time.perf_counter()
+
+    # Check if password-protected and decrypt if needed
+    if check_pdf_protected(file_bytes):
+        if not password:
+            raise RuntimeError(
+                "ENCRYPTED: This PDF is password-protected. "
+                "Please provide the password to proceed."
+            )
+        file_bytes = decrypt_pdf(file_bytes, password)
 
     text = ""
     use_ocr = False
