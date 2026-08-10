@@ -151,14 +151,20 @@ def _assemble_excel_rows(rows: list, header_idx: int, col_mapping: dict,
                 continue
 
             if _row_started():
-                for col_idx in text_cols:
-                    if col_idx < len(row_cells) and row_cells[col_idx]:
-                        fieldname = col_mapping.get(col_idx)
-                        if fieldname:
-                            if fieldname in current_row and current_row[fieldname]:
-                                current_row[fieldname] += " " + row_cells[col_idx]
-                            else:
-                                current_row[fieldname] = row_cells[col_idx]
+                # Text columns append; other mapped columns fill only if empty
+                for col_idx, cell in enumerate(row_cells):
+                    if not cell:
+                        continue
+                    fieldname = col_mapping.get(col_idx)
+                    if not fieldname:
+                        continue
+                    if col_idx in text_cols:
+                        if current_row.get(fieldname):
+                            current_row[fieldname] += " " + cell
+                        else:
+                            current_row[fieldname] = cell
+                    elif not current_row.get(fieldname):
+                        current_row[fieldname] = cell
 
     if _row_started():
         result.append(current_row)

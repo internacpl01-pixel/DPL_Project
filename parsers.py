@@ -9,7 +9,6 @@ import io
 import re
 import logging
 import time
-from collections import defaultdict
 
 logger = logging.getLogger(__name__)
 
@@ -234,55 +233,95 @@ def _extract_tables_from_pdf(file_bytes: bytes, table_settings: dict = None) -> 
     return tables
 
 
-def _extract_table_by_coordinates(file_bytes: bytes) -> list:
+def _merge_words_into_phrases(line_words: list, gap: float = 15) -> list:
+    """Merge adjacent words on one visual line into phrases (e.g. 'Running' +
+    'Balance' → 'Running Balance'). Words closer than `gap` px belong together."""
+    phrases = []
+    for w in sorted(line_words, key=lambda w: float(w["x0"])):
+        x0, x1 = float(w["x0"]), float(w["x1"])
+        if phrases and x0 - phrases[-1]["x1"] <= gap:
+            phrases[-1]["text"] += " " + w["text"]
+            phrases[-1]["x1"] = x1
+        else:
+            phrases.append({"text": w["text"], "x0": x0, "x1": x1})
+    return phrases
+
+
+def _extract_word_column_tables(file_bytes: bytes, alias_map: dict) -> list:
     """
-    Fallback: extract table structure using word coordinates.
-    Groups words into rows by y-position, columns by x-position.
+    Build tables from word coordinates — immune to pdfplumber's table-line
+    detection failures (merged rows, lost header/amount cells).
+
+    The header line is found by matching word-phrases against fieldmap aliases;
+    the matched header phrases define column x-boundaries, and every word below
+    is bucketed into a column by its x-center. Pages without a header line reuse
+    the previous page's boundaries (continuation pages).
+
+    Returns tables in the same row-list format as pdfplumber's extract_tables,
+    with the header phrases as the first row.
     """
     if not PDFPLUMBER_AVAILABLE:
         return []
     tables = []
+    prev_boundaries = None
+
     try:
         with pdfplumber.open(io.BytesIO(file_bytes)) as pdf:
             for page in pdf.pages:
-                words = page.extract_words()
+                words = page.extract_words() or []
                 if not words:
                     continue
 
-                # Group words into rows by y-position (cluster within 3px)
-                rows_by_y = defaultdict(list)
-                for w in words:
-                    y_key = round(float(w["top"]) / 3) * 3
-                    rows_by_y[y_key].append(w)
+                # Group words into visual lines by y-position
+                lines = []
+                for w in sorted(words, key=lambda w: (float(w["top"]), float(w["x0"]))):
+                    y = float(w["top"])
+                    if lines and abs(lines[-1][0] - y) <= 3:
+                        lines[-1][1].append(w)
+                    else:
+                        lines.append([y, [w]])
 
-                # Sort rows by y position (top to bottom)
-                sorted_rows = sorted(rows_by_y.items(), key=lambda x: x[0])
+                # Find the header line: the line whose phrases best match aliases
+                best_score, best_li, best_phrases = 0, -1, None
+                for li, (_, line_words) in enumerate(lines):
+                    phrases = _merge_words_into_phrases(line_words)
+                    score, matches = 0, 0
+                    for ph in phrases:
+                        fn, conf = _match_alias(ph["text"], alias_map)
+                        if fn:
+                            matches += 1
+                            score += conf
+                    if matches >= 2 and score >= 5 and score > best_score:
+                        best_score, best_li, best_phrases = score, li, phrases
 
-                if len(sorted_rows) < 2:
+                if best_li >= 0:
+                    cols = sorted(best_phrases, key=lambda p: p["x0"])
+                    boundaries = [(a["x1"] + b["x0"]) / 2 for a, b in zip(cols, cols[1:])]
+                    table = [[c["text"] for c in cols]]
+                    start_li = best_li + 1
+                elif prev_boundaries:
+                    boundaries = prev_boundaries
+                    table = []
+                    start_li = 0
+                else:
                     continue
 
-                # Get x-positions from first row (header candidates)
-                header_words = sorted(sorted_rows[0][1], key=lambda w: float(w["x0"]))
-                x_boundaries = []
-                for w in header_words:
-                    x_boundaries.append(float(w["x0"]))
+                ncols = len(boundaries) + 1
+                for _, line_words in lines[start_li:]:
+                    cells = [[] for _ in range(ncols)]
+                    for w in sorted(line_words, key=lambda w: float(w["x0"])):
+                        center = (float(w["x0"]) + float(w["x1"])) / 2
+                        idx = 0
+                        while idx < len(boundaries) and center > boundaries[idx]:
+                            idx += 1
+                        cells[idx].append(w["text"])
+                    table.append([" ".join(c) for c in cells])
 
-                # Group each row into columns based on x_boundaries
-                table_rows = []
-                for y_key, row_words in sorted_rows:
-                    row_words_sorted = sorted(row_words, key=lambda w: float(w["x0"]))
-                    cells = []
-                    for xb in x_boundaries:
-                        cell_words = [w["text"] for w in row_words_sorted
-                                     if abs(float(w["x0"]) - xb) < 30 or
-                                     (cells and float(w["x0"]) < xb + 50)]
-                        cells.append(" ".join(cell_words) if cell_words else "")
-                    table_rows.append(cells)
-
-                if table_rows:
-                    tables.append(table_rows)
+                if len(table) > 1 or (table and not boundaries):
+                    tables.append(table)
+                    prev_boundaries = boundaries
     except Exception as e:
-        logger.warning(f"[Parser] Coordinate extraction failed: {e}")
+        logger.warning(f"[Parser] Word-column extraction failed: {e}")
     return tables
 
 
@@ -434,15 +473,22 @@ def _assemble_rows(table_rows: list, header_idx: int, col_mapping: dict,
                 continue
 
             if current_row:
-                # Continuation row: append to text columns only
-                for col_idx in text_cols:
-                    if col_idx < len(row_cells) and row_cells[col_idx]:
-                        fieldname = col_mapping.get(col_idx)
-                        if fieldname:
-                            if fieldname in current_row and current_row[fieldname]:
-                                current_row[fieldname] += " " + row_cells[col_idx]
-                            else:
-                                current_row[fieldname] = row_cells[col_idx]
+                # Continuation row: text columns append; other mapped columns
+                # (amounts, dates) fill only if still empty — handles layouts
+                # where a value sits on a later line than the transaction date.
+                for col_idx, cell in enumerate(row_cells):
+                    if not cell:
+                        continue
+                    fieldname = col_mapping.get(col_idx)
+                    if not fieldname:
+                        continue
+                    if col_idx in text_cols:
+                        if current_row.get(fieldname):
+                            current_row[fieldname] += " " + cell
+                        else:
+                            current_row[fieldname] = cell
+                    elif not current_row.get(fieldname):
+                        current_row[fieldname] = cell
 
     # Save last row
     if current_row:
@@ -558,40 +604,37 @@ def parse_pdf(file_bytes: bytes, password: str = "", fieldmap_rows: list = None,
     # Live column types (passed from pdf_import, used for data-type-driven roles)
     live_col_types = live_col_types or {}
 
-    # Run BOTH table strategies and keep whichever assembles the most rows.
-    # Different statements defeat different strategies: ruled-lines fails when
-    # row separators aren't detectable (rows merge or vanish), text-lines fails
-    # when cells wrap oddly. Comparing results is layout-agnostic and generic.
+    # Run ALL extraction strategies and keep the best result. Different
+    # statements defeat different strategies: ruled-lines fails when row
+    # separators aren't detectable (rows merge or cells vanish), text-lines
+    # can lose header/amount cells, word-columns handles those but depends on
+    # a matchable header line. Comparing assembled output is layout-agnostic.
+    # Best = most rows, then most populated cells (catches dropped columns).
     candidates = []
     for label, settings in (("lines", None), ("text", {"horizontal_strategy": "text"})):
         tables = _extract_tables_from_pdf(file_bytes, settings)
         if tables:
-            assembled = _assemble_from_tables(tables, alias_map, live_col_types)
-            candidates.append((label, assembled))
-            logger.info(f"[Parser] strategy={label}: {len(assembled[0])} rows")
+            candidates.append((label, _assemble_from_tables(tables, alias_map, live_col_types)))
+    word_tables = _extract_word_column_tables(file_bytes, alias_map)
+    if word_tables:
+        candidates.append(("words", _assemble_from_tables(word_tables, alias_map, live_col_types)))
+
+    def _cand_score(cand):
+        cand_rows = cand[1][0]
+        if _has_merged_rows(cand_rows):
+            return (0, 0)  # merged-row signature — only wins if nothing else does
+        return (len(cand_rows), sum(len(r) for r in cand_rows))
 
     rows, headers_detected, unmapped_headers = [], {}, []
-    best_label = None
-    for label, (cand_rows, cand_hd, cand_um) in candidates:
-        # Prefer more rows; penalize candidates showing the merged-row signature
-        if _has_merged_rows(cand_rows):
-            continue
-        if len(cand_rows) > len(rows):
-            rows, headers_detected, unmapped_headers = cand_rows, cand_hd, cand_um
-            best_label = label
-    if not rows and candidates:
-        # Every candidate looked merged/empty — take the largest anyway
+    if candidates:
+        for label, assembled in candidates:
+            logger.info(f"[Parser] strategy={label}: rows={len(assembled[0])}, cells={sum(len(r) for r in assembled[0])}")
         best_label, (rows, headers_detected, unmapped_headers) = max(
-            candidates, key=lambda c: len(c[1][0]))
-    if best_label:
+            candidates, key=_cand_score)
+        if not rows:
+            best_label, (rows, headers_detected, unmapped_headers) = max(
+                candidates, key=lambda c: len(c[1][0]))
         logger.info(f"[Parser] selected strategy={best_label}, rows={len(rows)}")
-
-    # Word-coordinate clustering fallback
-    if not rows:
-        coord_tables = _extract_table_by_coordinates(file_bytes)
-        if coord_tables:
-            rows, headers_detected, unmapped_headers = _assemble_from_tables(
-                coord_tables, alias_map, live_col_types)
 
     t2 = time.perf_counter()
 
