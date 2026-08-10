@@ -3,6 +3,7 @@ Generic PDF statement parser.
 Uses pdfplumber table extraction + word-coordinate fallback.
 No bank-specific logic — fieldmap table drives all column mapping.
 """
+from __future__ import annotations
 
 import io
 import re
@@ -93,7 +94,10 @@ def _clean_amount(val) -> str:
     s = str(val).strip()
     if not s:
         return ""
-    s = re.sub(r"[RsINR,\s]", "", s)
+    # Strip currency prefixes (full tokens, not char-by-char)
+    s = re.sub(r"^(Rs\.?|INR|₹)\s*", "", s, flags=re.IGNORECASE)
+    # Strip commas and whitespace
+    s = re.sub(r"[,\s]", "", s)
     # Handle Dr/Cr suffix
     if s.upper().endswith("DR") and not s.endswith("-"):
         s = "-" + s[:-2].strip()
@@ -317,21 +321,28 @@ _FOOTER_KEYWORDS = {
     "opening balance", "summary", "grand total", "page",
 }
 
-_DATE_COLS_CANONICAL = {"date", "value_date", "entry_date", "tran_date", "txn_date"}
+
+def _fieldname_category(fieldname: str) -> str | None:
+    """Return the semantic category for a fieldname/alias, or None for custom fields.
+    Categories are stable concept names — they don't depend on any specific fieldmap string.
+    """
+    n = fieldname.lower().strip()
+    if n == "date" or n in ("value_date", "entry_date", "tran_date", "txn_date"):
+        return "date"
+    if n in ("description", "desc", "particulars", "narration", "remarks", "narrations"):
+        return "description"
+    if n in ("withdrawal", "debit", "dr", "amount_out"):
+        return "withdrawal"
+    if n in ("deposits", "deposit", "credit", "cr", "amount_in", "deposit amt"):
+        return "deposits"
+    if n in ("balance", "closing_balance", "available_balance"):
+        return "balance"
+    if n in ("reference_no", "ref_no", "chq_ref_no", "cheque_no", "reference", "instrument_no", "ref"):
+        return "reference_no"
+    return None  # custom field — passthrough
 
 
-def _is_footer_row(row_cells: list, col_mapping: dict) -> bool:
-    """Check if a row is a footer/summary row."""
-    for col_idx, cell in enumerate(row_cells):
-        cell_lower = str(cell).strip().lower()
-        if col_idx in col_mapping and col_mapping[col_idx] == "description":
-            for kw in _FOOTER_KEYWORDS:
-                if kw in cell_lower:
-                    return True
-    return False
-
-
-def _has_valid_date(row_cells: list, col_mapping: dict, date_col_idx: int) -> bool:
+def _has_valid_date(row_cells: list, date_col_idx: int) -> bool:
     """Check if a row has a valid date in the date column."""
     if date_col_idx is None or date_col_idx >= len(row_cells):
         return False
@@ -339,78 +350,97 @@ def _has_valid_date(row_cells: list, col_mapping: dict, date_col_idx: int) -> bo
     return bool(_parse_date_to_date(val))
 
 
-def _assemble_rows(table_rows: list, header_idx: int, col_mapping: dict) -> list:
+def _assemble_rows(table_rows: list, header_idx: int, col_mapping: dict,
+                    live_col_types: dict = None) -> list:
     """
-    Assemble transaction rows from table data.
-    Handles multi-line descriptions (date-less rows following a date row).
-    Skips footer/summary rows.
+    Assemble transaction rows from table data using fieldmap + column types.
+
+    Row keys = fieldmap fieldnames (not hardcoded names).
+    Column roles come from information_schema data types:
+      • DATE type     → anchor column (starts a new row)
+      • TEXT type     → text column (continuation lines + footer check)
+      • NUMERIC type  → numeric column (amounts, cleaned)
+
+    Handles multi-line descriptions. Skips footer/summary rows.
     """
-    # Find the date column
-    date_col = None
+    # Determine column roles from live column types
+    live_col_types = live_col_types or {}
+    date_col = None       # anchor column — starts a new row
+    text_cols = set()     # text columns — receive continuation lines
+    numeric_cols = set()  # numeric columns — receive cleaned amounts
+
     for col_idx, fieldname in col_mapping.items():
-        if fieldname in _DATE_COLS_CANONICAL:
+        col_type = (live_col_types.get(fieldname) or "").lower()
+        if col_type in ("date", "timestamp without time zone", "timestamp"):
             date_col = col_idx
-            break
+        elif col_type in ("text", "character varying", "varchar"):
+            text_cols.add(col_idx)
+        elif col_type in ("real", "double precision", "numeric", "integer", "bigint"):
+            numeric_cols.add(col_idx)
+
+    # Fallback: if no date column found by type, use name heuristics
+    if date_col is None:
+        for col_idx, fieldname in col_mapping.items():
+            fn_lower = fieldname.lower()
+            if fn_lower in ("date", "value_date", "entry_date", "tran_date", "txn_date"):
+                date_col = col_idx
+                break
 
     rows = []
     current_row = None
+    date_fieldname = None  # the fieldmap fieldname for the date column
 
     for row_idx in range(header_idx + 1, len(table_rows)):
         row_cells = table_rows[row_idx]
-
         if not row_cells:
             continue
 
-        # Clean empty cells
         row_cells = [str(c).strip() if c else "" for c in row_cells]
 
-        # Skip footer/summary rows
-        if _is_footer_row(row_cells, col_mapping):
-            if current_row:
+        # Check for footer: text columns contain footer keywords
+        is_footer = False
+        for col_idx in text_cols:
+            if col_idx < len(row_cells):
+                cell_lower = row_cells[col_idx].lower()
+                for kw in _FOOTER_KEYWORDS:
+                    if kw == cell_lower or cell_lower.startswith(kw):
+                        is_footer = True
+                        break
+            if is_footer:
+                break
+        if is_footer:
+            if current_row and date_fieldname and current_row.get(date_fieldname):
                 rows.append(current_row)
                 current_row = None
             continue
 
-        # Check if this row has a valid date
+        # Check if this row starts with a valid date (anchor column)
         if date_col is not None and _has_valid_date(row_cells, date_col):
-            # Save previous row
-            if current_row and current_row.get("date"):
+            if current_row and date_fieldname and current_row.get(date_fieldname):
                 rows.append(current_row)
 
-            # Start new row
-            current_row = {
-                "date": _parse_date(row_cells[date_col]),
-                "description": "",
-                "withdrawal": "",
-                "deposits": "",
-                "balance": "",
-                "reference_no": "",
-            }
-            # Fill other columns
+            current_row = {}
             for col_idx, cell in enumerate(row_cells):
-                if col_idx == date_col:
-                    continue
                 fieldname = col_mapping.get(col_idx)
-                if not fieldname:
+                if not fieldname or not cell:
                     continue
-                if fieldname == "description":
-                    current_row["description"] = cell
-                elif fieldname == "withdrawal":
-                    current_row["withdrawal"] = cell
-                elif fieldname == "deposits":
-                    current_row["deposits"] = cell
-                elif fieldname == "balance":
-                    current_row["balance"] = cell
-                elif fieldname == "reference_no":
-                    current_row["reference_no"] = cell
-        elif current_row and current_row.get("date"):
-            # Continuation of previous row — append description
-            desc_parts = [c for c in row_cells if c]
-            if desc_parts:
-                current_row["description"] += " " + " ".join(desc_parts)
+                current_row[fieldname] = cell
+                if col_idx == date_col:
+                    date_fieldname = fieldname
+
+        elif current_row and date_fieldname and current_row.get(date_fieldname):
+            # Continuation row: append to text columns only
+            for col_idx in text_cols:
+                if col_idx < len(row_cells) and row_cells[col_idx]:
+                    fieldname = col_mapping.get(col_idx)
+                    if fieldname:
+                        if fieldname in current_row and current_row[fieldname]:
+                            current_row[fieldname] += " " + row_cells[col_idx]
+                        else:
+                            current_row[fieldname] = row_cells[col_idx]
 
     # Save last row
-    if current_row and current_row.get("date"):
+    if current_row and date_fieldname and current_row.get(date_fieldname):
         rows.append(current_row)
 
     return rows
@@ -418,7 +448,8 @@ def _assemble_rows(table_rows: list, header_idx: int, col_mapping: dict) -> list
 
 # ── Generic parser ──────────────────────────────────────────────────────────
 
-def parse_pdf(file_bytes: bytes, password: str = "", fieldmap_rows: list = None) -> dict:
+def parse_pdf(file_bytes: bytes, password: str = "", fieldmap_rows: list = None,
+              live_col_types: dict = None) -> dict:
     """
     Parse a PDF bank statement and return normalized rows.
 
@@ -459,8 +490,15 @@ def parse_pdf(file_bytes: bytes, password: str = "", fieldmap_rows: list = None)
     # Build alias map from fieldmap (for header matching)
     alias_map = _build_alias_map(fieldmap_rows or [])
 
-    # Try table extraction first
+    # Live column types (passed from pdf_import, used for data-type-driven roles)
+    live_col_types = live_col_types or {}
+
+    # Try table extraction first (ruled lines)
     tables = _extract_tables_from_pdf(file_bytes)
+
+    # Fallback: word-coordinate clustering (PDFs without ruled lines)
+    if not tables:
+        tables = _extract_table_by_coordinates(file_bytes)
 
     t2 = time.perf_counter()
 
@@ -487,9 +525,6 @@ def parse_pdf(file_bytes: bytes, password: str = "", fieldmap_rows: list = None)
                 for col_idx, fn in col_mapping.items():
                     if col_idx < len(table[header_idx]):
                         headers_detected[fn] = str(table[header_idx][col_idx])
-                        # Track unmapped
-                        if fn.startswith("field_") or fn in (c.lower() for c in table[header_idx] if _match_alias(str(c), alias_map)[0] is None):
-                            pass
 
                 # Collect unmapped headers
                 for col_idx, cell in enumerate(table[header_idx]):
@@ -497,8 +532,8 @@ def parse_pdf(file_bytes: bytes, password: str = "", fieldmap_rows: list = None)
                     if cell_str and col_idx not in col_mapping:
                         unmapped_headers.append(cell_str)
 
-                # Assemble rows
-                rows = _assemble_rows(table, header_idx, col_mapping)
+                # Assemble rows (with live column types for data-type-driven roles)
+                rows = _assemble_rows(table, header_idx, col_mapping, live_col_types)
 
                 if rows:
                     break
@@ -518,17 +553,44 @@ def parse_pdf(file_bytes: bytes, password: str = "", fieldmap_rows: list = None)
 
     t3 = time.perf_counter()
 
-    # Normalize rows
+    # Resolve parser concept-keys to master column names via fieldmap.
+    # Fallback rows use concept names ("description", "withdrawal" etc.).
+    # Table rows already have fieldmap fieldnames as keys — those pass through unchanged.
+    # Build category→fieldname mapping from fieldmap's display names.
+    _category_map = {}
+    for alias, fieldname in (alias_map or {}).items():
+        cat = _fieldname_category(fieldname)
+        if cat and cat not in _category_map:
+            _category_map[cat] = fieldname
+
+    canonical_to_master = {}
+    for parser_key in ("date", "description", "withdrawal", "deposits", "balance", "reference_no"):
+        cat = _fieldname_category(parser_key)
+        master_col = _category_map.get(cat)
+        if master_col:
+            canonical_to_master[parser_key] = master_col
+        else:
+            # No fieldmap entry for this category — use the key as-is
+            # (works for default columns like "date" which exists in schema directly)
+            canonical_to_master[parser_key] = parser_key
+
+    # Normalize rows: coerce types from live_col_types (not hardcoded names)
     normalized = []
     for r in rows:
-        normalized.append({
-            "date": _parse_date(r.get("date", "")),
-            "description": (r.get("description") or "").strip(),
-            "withdrawal": _clean_amount(r.get("withdrawal", "")),
-            "deposits": _clean_amount(r.get("deposits", "")),
-            "balance": _clean_amount(r.get("balance", "")),
-            "reference_no": (r.get("reference_no") or "").strip(),
-        })
+        new_row = {}
+        for key, val in r.items():
+            if val is None or val == "":
+                continue
+            col_type = (live_col_types.get(key) or "").lower()
+            if col_type in ("date", "timestamp without time zone", "timestamp"):
+                new_row[key] = _parse_date(val)
+            elif col_type in ("real", "double precision", "numeric", "integer", "bigint"):
+                cleaned = _clean_amount(val)
+                new_row[key] = cleaned
+            else:
+                new_row[key] = str(val).strip()
+        if new_row:
+            normalized.append(new_row)
 
     t4 = time.perf_counter()
     logger.info(
@@ -656,12 +718,12 @@ def _extract_amounts(row: dict, text: str, amt_pattern, amt_triple):
         if not row.get("balance"):
             row["balance"] = amounts[0]
     elif len(amounts) >= 2:
+        # First amount = transaction amount (withdrawal if Dr sign present)
         if not row.get("withdrawal"):
             row["withdrawal"] = amounts[0]
-        if not row.get("deposits"):
-            row["deposits"] = amounts[1]
-        if len(amounts) >= 3 and not row.get("balance"):
-            row["balance"] = amounts[2]
+        # Second amount = running balance (NOT deposits)
+        if not row.get("balance"):
+            row["balance"] = amounts[1]
 
     ref_match = re.search(r"(\d{10,})\s*$", text)
     if ref_match:
@@ -670,6 +732,7 @@ def _extract_amounts(row: dict, text: str, amt_pattern, amt_triple):
 
 # ── Main entry point ────────────────────────────────────────────────────────
 
-def _parse_sync(file_bytes: bytes, password: str = "", fieldmap_rows: list = None) -> dict:
+def _parse_sync(file_bytes: bytes, password: str = "", fieldmap_rows: list = None, live_col_types: dict = None) -> dict:
     """Sync wrapper for use with run_in_executor."""
-    return parse_pdf(file_bytes, password=password, fieldmap_rows=fieldmap_rows or [])
+    return parse_pdf(file_bytes, password=password, fieldmap_rows=fieldmap_rows or [],
+                     live_col_types=live_col_types or {})

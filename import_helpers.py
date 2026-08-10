@@ -61,16 +61,26 @@ def resolve_field_map(fieldmap_rows: list) -> dict:
     return alias_map
 
 
+def resolve_column(header_name: str, alias_map: dict) -> str:
+    """Map a PDF column header to a canonical master fieldname."""
+    cleaned = header_name.strip().lower()
+    if cleaned in alias_map:
+        return alias_map[cleaned]
+    normalized = re.sub(r"[^\w\s]", "", cleaned).strip()
+    if normalized in alias_map:
+        return alias_map[normalized]
+    return cleaned
+
+
 async def append_rows_to_master(conn, rows: list, fieldmap_rows: list) -> int:
     """
-    Insert parsed rows into master table using fieldmap for column mapping.
-    Type-aware: dates → DATE, numeric columns → REAL, rest → TEXT.
-    Chunks inserts to stay under asyncpg's 32,767 parameter limit.
+    Insert parsed rows into master table.
+    Row keys are already fieldmap fieldnames (master column names).
+    Type-aware coercion: dates → DATE, numerics → REAL, rest → TEXT.
+    Chunked INSERTs stay under asyncpg's 32,767 parameter limit.
     """
     if not rows:
         return 0
-
-    alias_map = resolve_field_map(fieldmap_rows)
 
     # Get live columns and their types from information_schema
     live_col_rows = await conn.fetch(
@@ -79,64 +89,43 @@ async def append_rows_to_master(conn, rows: list, fieldmap_rows: list) -> int:
     )
     live_cols = {r["column_name"]: r["data_type"] for r in live_col_rows}
 
-    # Canonical parser keys → how to resolve them to master columns
-    canonical_keys = {
-        "date":      {"category": "date"},
-        "description": {"category": "description"},
-        "withdrawal":  {"category": "withdrawal"},
-        "deposits":    {"category": "deposits"},
-        "balance":     {"category": "balance"},
-        "reference_no": {"category": "reference"},
-    }
+    # Collect all column keys from rows, filter to live columns only
+    all_keys = set()
+    for row in rows:
+        all_keys.update(k for k in row.keys() if k in live_cols and k != "_date_raw")
 
-    # For each canonical key, find the best matching master column
-    key_to_master = {}
-    for ck in canonical_keys:
-        for alias, fieldname in alias_map.items():
-            if canonical_keys[ck]["category"] == fieldname or ck == fieldname:
-                if fieldname in live_cols:
-                    key_to_master[ck] = fieldname
-                    break
+    cols_list = sorted(all_keys)
+    if not cols_list:
+        return 0
 
-    if not key_to_master:
-        # No fieldmap configured yet — use defaults
-        key_to_master = {
-            "date": "date",
-            "description": "desc",
-            "withdrawal": "withdrawal",
-            "deposits": "deposits",
-            "balance": "balance",
-        }
-        # Only keep columns that actually exist
-        key_to_master = {k: v for k, v in key_to_master.items() if v in live_cols}
-
-    cols_list = sorted(key_to_master.values())
     col_indices = {c: i for i, c in enumerate(cols_list)}
 
     # Build flat values array, coercing types per column
     flat_values = []
     for row in rows:
         row_vals = [None] * len(cols_list)
-        for parser_key, master_col in key_to_master.items():
-            val = row.get(parser_key, "")
+        for col in cols_list:
+            val = row.get(col)
             if val is None or val == "":
                 continue
 
-            col_type = live_cols.get(master_col, "text")
+            col_type = live_cols.get(col, "text").lower()
 
             if col_type in ("date", "timestamp without time zone", "timestamp"):
                 d = _parse_date_to_date(val)
                 if d is None:
                     continue
-                row_vals[col_indices[master_col]] = d
-            elif col_type in ("real", "double precision", "numeric"):
+                row_vals[col_indices[col]] = d
+            elif col_type in ("real", "double precision", "numeric", "integer", "bigint"):
                 try:
-                    row_vals[col_indices[master_col]] = float(str(val).replace(",", ""))
+                    cleaned = str(val).replace(",", "").strip()
+                    if cleaned:
+                        row_vals[col_indices[col]] = float(cleaned)
                 except (ValueError, TypeError):
                     continue
             else:
                 # TEXT or other — keep as string
-                row_vals[col_indices[master_col]] = str(val).strip()
+                row_vals[col_indices[col]] = str(val).strip()
 
         if any(v is not None for v in row_vals):
             flat_values.extend(row_vals)
@@ -144,8 +133,8 @@ async def append_rows_to_master(conn, rows: list, fieldmap_rows: list) -> int:
     if not flat_values:
         return 0
 
-    # Chunked INSERT to stay under asyncpg's 32,767 parameter limit
-    CHUNK_SIZE = 200  # rows per chunk
+    # Chunked INSERT
+    CHUNK_SIZE = 200
     cols_str = ", ".join(f'"{c}"' if c == 'desc' else c for c in cols_list)
 
     total_inserted = 0

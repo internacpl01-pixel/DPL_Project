@@ -8,6 +8,7 @@ from services.mappings import (
     get_table_structure,
     get_change_log,
     update_field_mapping,
+    _invalidate_field_mappings_cache,
 )
 from database import Database
 
@@ -162,6 +163,8 @@ async def create_custom_field(body: CustomFieldRequest, current_user: dict = Dep
         )
         from services.data import _invalidate_live_cols_cache
         _invalidate_live_cols_cache()
+        # Also invalidate fieldmap cache (the new fieldmap row won't be visible until TTL expires)
+        _invalidate_field_mappings_cache()
         await conn.execute(
             "INSERT INTO fieldmap (fieldname, displayname, mapfields) VALUES ($1, $2, $3) "
             "ON CONFLICT (fieldname) DO UPDATE SET displayname=EXCLUDED.displayname, mapfields=EXCLUDED.mapfields",

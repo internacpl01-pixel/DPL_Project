@@ -11,20 +11,27 @@ logger = logging.getLogger(__name__)
 async def process_pdf_import(file_bytes: bytes, save: bool = False, password: str = ""):
     t_start = time.perf_counter()
 
-    # Fetch fieldmap BEFORE dispatching to executor (DB access stays in async context)
-    fieldmap_rows = []
-    if save:
-        t_fm_start = time.perf_counter()
-        fieldmap_rows = await get_field_mappings()
-        t_fm = (time.perf_counter() - t_fm_start) * 1000
-        logger.info(f"[PDF] fieldmap fetch: {t_fm:.0f}ms, rows={len(fieldmap_rows)}")
+    # Fetch fieldmap + live column types BEFORE dispatching to executor
+    # (DB access stays in async context; both are needed for header detection)
+    fieldmap_rows = await get_field_mappings()
+    logger.info(f"[PDF] fieldmap fetch: {len(fieldmap_rows)} mappings")
+
+    live_col_types = {}
+    async with Database.acquire() as conn:
+        col_rows = await conn.fetch(
+            "SELECT column_name, data_type FROM information_schema.columns "
+            "WHERE table_name = 'master' ORDER BY ordinal_position"
+        )
+        live_col_types = {r["column_name"]: r["data_type"] for r in col_rows}
+    logger.info(f"[PDF] live columns: {len(live_col_types)}")
 
     loop = asyncio.get_running_loop()
     t0 = time.perf_counter()
     try:
         from parsers import _parse_sync
         result = await asyncio.wait_for(
-            loop.run_in_executor(None, _parse_sync, file_bytes, password, fieldmap_rows),
+            loop.run_in_executor(None, _parse_sync, file_bytes, password,
+                                 fieldmap_rows, live_col_types),
             timeout=180.0,
         )
     except asyncio.TimeoutError:
