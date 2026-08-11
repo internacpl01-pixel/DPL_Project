@@ -2,10 +2,10 @@
   "version": "0.0.1",
   "configurations": [
     {
-      "name": "frontend-static",
+      "name": "dpl-backend",
       "runtimeExecutable": "C:\\Users\\Win11-A\\Desktop\\DPL_project\\backend\\venv\\Scripts\\python.exe",
-      "runtimeArgs": ["-m", "http.server", "8123", "--directory", "C:\\Users\\Win11-A\\Desktop\\DPL_project\\frontend"],
-      "port": 8123
+      "runtimeArgs": ["main.py"],
+      "port": 5000
     }
   ]
 }

@@ -9,10 +9,34 @@ logger = logging.getLogger(__name__)
 _LIVE_COLS_CACHE = {"cols": None, "expires_at": 0}
 _LIVE_COLS_TTL = 30
 
+_TOTAL_COUNT_CACHE = {"total": None, "expires_at": 0}
+_TOTAL_COUNT_TTL = 15
+
 
 def _invalidate_live_cols_cache():
     _LIVE_COLS_CACHE["cols"] = None
     _LIVE_COLS_CACHE["expires_at"] = 0
+
+
+def _invalidate_total_count_cache():
+    _TOTAL_COUNT_CACHE["total"] = None
+    _TOTAL_COUNT_CACHE["expires_at"] = 0
+
+
+async def _get_total_count() -> int:
+    """Row count for pagination — cached briefly so clicking through pages
+    doesn't re-scan the whole table on every click. Invalidated on any
+    insert/delete/truncate so it never drifts more than the TTL."""
+    now = _time.time()
+    cached = _TOTAL_COUNT_CACHE
+    if cached["total"] is not None and now < cached["expires_at"]:
+        return cached["total"]
+
+    total_row = await Database.fetchrow("SELECT COUNT(*) FROM master")
+    total = total_row["count"] if total_row else 0
+    cached["total"] = total
+    cached["expires_at"] = now + _TOTAL_COUNT_TTL
+    return total
 
 
 async def get_live_columns() -> list:
@@ -35,8 +59,7 @@ async def get_live_columns() -> list:
 
 async def get_master_rows(limit: int = 50, offset: int = 0) -> dict:
     t0 = _time.time()
-    total_row = await Database.fetchrow("SELECT COUNT(*) FROM master")
-    total = total_row["count"] if total_row else 0
+    total = await _get_total_count()
 
     live_cols = await get_live_columns()
     col_names = [c["name"] for c in live_cols]
@@ -74,12 +97,16 @@ async def get_master_rows(limit: int = 50, offset: int = 0) -> dict:
 
 async def delete_master_row(row_id: int) -> bool:
     result = await Database.execute("DELETE FROM master WHERE id=$1", row_id)
-    return result != "DELETE 0"
+    deleted = result != "DELETE 0"
+    if deleted:
+        _invalidate_total_count_cache()
+    return deleted
 
 
 async def truncate_master() -> int:
     result = await Database.execute("TRUNCATE TABLE master RESTART IDENTITY CASCADE")
     count = await Database.fetchval("SELECT COUNT(*) FROM master")
+    _invalidate_total_count_cache()
     return count
 
 

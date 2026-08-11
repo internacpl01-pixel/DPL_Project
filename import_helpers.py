@@ -160,4 +160,8 @@ async def append_rows_to_master(conn, rows: list, fieldmap_rows: list) -> int:
     if dropped_count:
         logger.warning(f"[import_helpers] Dropped {dropped_count} rows where all values failed type coercion")
 
+    if total_inserted:
+        from services.data import _invalidate_total_count_cache
+        _invalidate_total_count_cache()
+
     return total_inserted
