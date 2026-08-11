@@ -16,7 +16,8 @@ import openpyxl
 
 from services.mappings import get_field_mappings
 from database import Database
-from parsers import _build_alias_map, _detect_header_row, _assemble_rows
+from parsers import (_build_alias_map, _detect_header_row, _assemble_rows,
+                     _extract_document_level_fields)
 
 logger = logging.getLogger(__name__)
 
@@ -99,6 +100,19 @@ async def process_excel_import(file_bytes: bytes, save: bool = False):
     if carry:
         assembled.append(carry)
 
+    # Document-level fields: custom fields whose value sits above the table
+    # (e.g. "Account Number 045563200000264" in the sheet's header rows)
+    doc_fields = {}
+    if assembled and header_idx > 0:
+        header_text = "\n".join(" ".join(r) for r in rows[:header_idx])
+        filled_keys = set()
+        for r in assembled:
+            filled_keys.update(r.keys())
+        doc_fields = _extract_document_level_fields(header_text, fieldmap_rows, filled_keys)
+        for r in assembled:
+            for fn, val in doc_fields.items():
+                r.setdefault(fn, val)
+
     # Per-field fill rates
     total_rows = len(assembled)
     fill_rates = {}
@@ -125,6 +139,7 @@ async def process_excel_import(file_bytes: bytes, save: bool = False):
         "inserted": inserted_count,
         "headers_detected": headers_detected,
         "unmapped_headers": unmapped_headers,
+        "document_fields": doc_fields,
         "stats": {"dates_in_raw_text": 0},
         "fill_rates": fill_rates,
     }

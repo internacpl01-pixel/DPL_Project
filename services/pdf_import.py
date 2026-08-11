@@ -73,6 +73,7 @@ async def process_pdf_import(file_bytes: bytes, save: bool = False, password: st
         "inserted": inserted_count,
         "headers_detected": headers_detected,
         "unmapped_headers": unmapped_headers,
+        "document_fields": result.get("document_fields", {}),
         "stats": stats,
         "fill_rates": fill_rates,
     }

@@ -728,6 +728,58 @@ def _assemble_rows(table_rows: list, header_idx: int, col_mapping: dict,
     return rows, current_row
 
 
+# ── Document-level fields ───────────────────────────────────────────────────
+
+def _extract_document_level_fields(text: str, fieldmap_rows: list, filled_fields: set) -> dict:
+    """
+    Extract values printed OUTSIDE the transaction table — e.g. an account
+    number in the statement header: "... your account number 045563200000264".
+
+    Only custom fields (no semantic category — never date/desc/amounts/balance,
+    which are per-transaction) that did not receive a value from any table
+    column are considered. Each field's aliases (mapfields, displayname,
+    fieldname) are searched in the raw text as "<alias> <value>"; the last
+    alias word may be a prefix of the printed word ("account num" matches
+    "account number"). The value must be ≥4 chars and contain a digit.
+    The found value applies to every row (document-level constant).
+    """
+    doc_fields = {}
+    if not text:
+        return doc_fields
+
+    for row in (fieldmap_rows or []):
+        fieldname = row.get("fieldname", "")
+        if not fieldname or fieldname in filled_fields:
+            continue
+        if _fieldname_category(fieldname) is not None:
+            continue
+
+        aliases = set()
+        for src in (row.get("mapfields", "") or "").split(","):
+            norm = _normalize_for_matching(src)
+            if norm:
+                aliases.add(norm)
+        for src in (row.get("displayname", ""), fieldname):
+            norm = _normalize_for_matching(src or "")
+            if norm:
+                aliases.add(norm)
+
+        for alias in sorted(aliases, key=len, reverse=True):
+            if len(alias) < 4:
+                continue  # too short — would match random text
+            words = [re.escape(w) for w in alias.split()]
+            words[-1] = words[-1] + r"[a-z]*"
+            pattern = r"\b" + r"[\s._\-]*".join(words) + r"[\s:\-–=]*([A-Za-z0-9][A-Za-z0-9/\-]*)"
+            m = re.search(pattern, text, re.IGNORECASE)
+            if m:
+                val = m.group(1).strip()
+                if len(val) >= 4 and any(ch.isdigit() for ch in val):
+                    doc_fields[fieldname] = val
+                    break
+
+    return doc_fields
+
+
 # ── Multi-table assembly ────────────────────────────────────────────────────
 
 _DATE_TOKEN_RE = re.compile(
@@ -958,6 +1010,19 @@ def parse_pdf(file_bytes: bytes, password: str = "", fieldmap_rows: list = None,
         if new_row:
             normalized.append(new_row)
 
+    # Document-level fields: custom fields with no table column (e.g. an
+    # account number printed above the table) get their value from raw text
+    # and are stamped on every row.
+    filled_keys = set()
+    for r in normalized:
+        filled_keys.update(r.keys())
+    doc_fields = _extract_document_level_fields(text, fieldmap_rows or [], filled_keys)
+    if doc_fields:
+        logger.info(f"[Parser] document-level fields: {doc_fields}")
+        for r in normalized:
+            for fn, val in doc_fields.items():
+                r.setdefault(fn, val)
+
     # Reconciliation: count date-like tokens in raw text for debugging
     _date_tokens = re.findall(r"\b\d{1,2}[-/]\d{1,2}[-/]\d{2,4}\b", text)
 
@@ -973,6 +1038,7 @@ def parse_pdf(file_bytes: bytes, password: str = "", fieldmap_rows: list = None,
         "row_count": len(normalized),
         "headers_detected": headers_detected,
         "unmapped_headers": unmapped_headers,
+        "document_fields": doc_fields,
         "raw_text": text[:2000],
         "stats": {
             "dates_in_raw_text": len(_date_tokens),
