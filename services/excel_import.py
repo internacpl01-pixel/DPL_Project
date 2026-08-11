@@ -195,7 +195,7 @@ async def process_excel_import(file_bytes: bytes, save: bool = False):
         raise RuntimeError(f"Failed to read Excel file: {e}")
 
     if not rows:
-        return {"rows": [], "row_count": 0, "inserted": 0, "headers_detected": {}, "unmapped_headers": []}
+        return {"rows": [], "row_count": 0, "inserted": 0, "headers_detected": {}, "unmapped_headers": [], "stats": {}}
 
     header_idx, col_mapping = _detect_header_row(rows, alias_map)
 
@@ -207,6 +207,7 @@ async def process_excel_import(file_bytes: bytes, save: bool = False):
             "headers_detected": {},
             "unmapped_headers": [],
             "error": "Could not detect a header row. Ensure column headers match your fieldmap aliases.",
+            "stats": {},
         }
 
     headers_detected = {}
@@ -236,4 +237,5 @@ async def process_excel_import(file_bytes: bytes, save: bool = False):
         "inserted": inserted_count,
         "headers_detected": headers_detected,
         "unmapped_headers": unmapped_headers,
+        "stats": {"dates_in_raw_text": 0},  # not tracked for Excel yet
     }

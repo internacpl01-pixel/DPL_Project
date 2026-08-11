@@ -36,7 +36,7 @@ async def create_tables():
                 created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
             )
         """)
-        for col, sql_type in [("date", "DATE"), ("desc", "TEXT"), ("withdrawal", "REAL"), ("deposits", "REAL"), ("balance", "REAL")]:
+        for col, sql_type in [("date", "DATE"), ("desc", "TEXT"), ("withdrawal", "NUMERIC(18,2)"), ("deposits", "NUMERIC(18,2)"), ("balance", "NUMERIC(18,2)")]:
             has_col = await conn.fetchval(
                 "SELECT 1 FROM information_schema.columns WHERE table_name=$1 AND column_name=$2",
                 "master", col,

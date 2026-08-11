@@ -139,7 +139,7 @@ async def create_custom_field(body: CustomFieldRequest, current_user: dict = Dep
     if field_type not in ("date", "num", "text"):
         raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail="Invalid type. Use date, num, or text")
 
-    type_map = {"date": ("DATE", "field_date"), "num": ("REAL", "field_num"), "text": ("TEXT", "field_text")}
+    type_map = {"date": ("DATE", "field_date"), "num": ("NUMERIC(18,2)", "field_num"), "text": ("TEXT", "field_text")}
     sql_type, prefix = type_map[field_type]
 
     async with Database.acquire() as conn:

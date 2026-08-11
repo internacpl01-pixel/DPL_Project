@@ -42,7 +42,8 @@ async def process_pdf_import(file_bytes: bytes, save: bool = False, password: st
     rows = result.get("rows", [])
     headers_detected = result.get("headers_detected", {})
     unmapped_headers = result.get("unmapped_headers", [])
-    logger.info(f"[PDF] parse: {t_parse:.0f}ms, rows={len(rows)}")
+    stats = result.get("stats", {})
+    logger.info(f"[PDF] parse: {t_parse:.0f}ms, rows={len(rows)}, stats={stats}")
 
     inserted_count = 0
     if save and rows:
@@ -61,4 +62,5 @@ async def process_pdf_import(file_bytes: bytes, save: bool = False, password: st
         "inserted": inserted_count,
         "headers_detected": headers_detected,
         "unmapped_headers": unmapped_headers,
+        "stats": stats,
     }

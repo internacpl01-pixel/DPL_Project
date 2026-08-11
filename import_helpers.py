@@ -7,6 +7,7 @@ and appending rows to the master table using type-aware normalization.
 import logging
 import re
 from datetime import date as _date
+from decimal import Decimal, InvalidOperation
 
 logger = logging.getLogger(__name__)
 
@@ -102,6 +103,7 @@ async def append_rows_to_master(conn, rows: list, fieldmap_rows: list) -> int:
 
     # Build flat values array, coercing types per column
     flat_values = []
+    dropped_count = 0
     for row in rows:
         row_vals = [None] * len(cols_list)
         for col in cols_list:
@@ -120,8 +122,8 @@ async def append_rows_to_master(conn, rows: list, fieldmap_rows: list) -> int:
                 try:
                     cleaned = str(val).replace(",", "").strip()
                     if cleaned:
-                        row_vals[col_indices[col]] = round(float(cleaned), 2)
-                except (ValueError, TypeError):
+                        row_vals[col_indices[col]] = Decimal(cleaned).quantize(Decimal("0.01"))
+                except (ValueError, TypeError, InvalidOperation):
                     continue
             else:
                 # TEXT or other — keep as string
@@ -129,6 +131,8 @@ async def append_rows_to_master(conn, rows: list, fieldmap_rows: list) -> int:
 
         if any(v is not None for v in row_vals):
             flat_values.extend(row_vals)
+        else:
+            dropped_count += 1
 
     if not flat_values:
         return 0
@@ -152,5 +156,8 @@ async def append_rows_to_master(conn, rows: list, fieldmap_rows: list) -> int:
         sql = f"INSERT INTO master ({cols_str}) VALUES {', '.join(placeholders)}"
         await conn.execute(sql, *chunk_vals)
         total_inserted += num_rows
+
+    if dropped_count:
+        logger.warning(f"[import_helpers] Dropped {dropped_count} rows where all values failed type coercion")
 
     return total_inserted

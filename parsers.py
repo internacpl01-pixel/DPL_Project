@@ -398,9 +398,12 @@ def _has_valid_date(row_cells: list, date_col_idx: int) -> bool:
 
 
 def _assemble_rows(table_rows: list, header_idx: int, col_mapping: dict,
-                    live_col_types: dict = None) -> list:
+                    live_col_types: dict = None, current_row=None) -> tuple:
     """
     Assemble transaction rows from table data using fieldmap + column types.
+
+    Returns (rows, current_row) so the caller can carry state across tables
+    (continuation pages, page-spanning transactions).
 
     Row keys = fieldmap fieldnames (not hardcoded names).
     Column roles come from information_schema data types:
@@ -429,7 +432,7 @@ def _assemble_rows(table_rows: list, header_idx: int, col_mapping: dict,
                 date_cols.append(col_idx)
 
     rows = []
-    current_row = None
+    current_row = current_row  # accept from caller (carried across tables)
 
     for row_idx in range(header_idx + 1, len(table_rows)):
         row_cells = table_rows[row_idx]
@@ -493,8 +496,9 @@ def _assemble_rows(table_rows: list, header_idx: int, col_mapping: dict,
     # Save last row
     if current_row:
         rows.append(current_row)
+        current_row = None
 
-    return rows
+    return rows, current_row
 
 
 # ── Multi-table assembly ────────────────────────────────────────────────────
@@ -518,14 +522,17 @@ def _has_merged_rows(rows: list) -> bool:
     return False
 
 
-def _assemble_from_tables(tables: list, alias_map: dict, live_col_types: dict) -> tuple:
+def _assemble_from_tables(tables: list, alias_map: dict, live_col_types: dict,
+                          current_row=None) -> tuple:
     """
     Assemble rows from ALL tables (all pages), not just the first.
     Tables with a detectable header are parsed with their own column mapping;
-    header-less tables (continuation pages) reuse the previous table's mapping
-    when the column count matches.
+    header-less tables (continuation pages) reuse the previous table's mapping.
 
-    Returns (rows, headers_detected, unmapped_headers).
+    Accepts and returns current_row so page-spanning transactions are preserved
+    across table boundaries.
+
+    Returns (rows, headers_detected, unmapped_headers, current_row).
     """
     all_rows = []
     headers_detected = {}
@@ -537,6 +544,7 @@ def _assemble_from_tables(tables: list, alias_map: dict, live_col_types: dict) -
         if not table:
             continue
 
+        table_len = len(table[0]) if table else 0
         header_idx, col_mapping = _detect_header_row(table, alias_map)
         if header_idx >= 0 and col_mapping and len(col_mapping) >= 2:
             header_row = table[header_idx]
@@ -548,14 +556,17 @@ def _assemble_from_tables(tables: list, alias_map: dict, live_col_types: dict) -
                 if cell_str and col_idx not in col_mapping and cell_str not in unmapped_headers:
                     unmapped_headers.append(cell_str)
 
-            all_rows.extend(_assemble_rows(table, header_idx, col_mapping, live_col_types))
+            new_rows, current_row = _assemble_rows(table, header_idx, col_mapping, live_col_types, current_row)
+            all_rows.extend(new_rows)
             last_mapping = col_mapping
             last_ncols = len(header_row)
-        elif last_mapping and len(table[0]) == last_ncols:
-            # Continuation page without a repeated header — reuse previous mapping
-            all_rows.extend(_assemble_rows(table, -1, last_mapping, live_col_types))
+        elif last_mapping and abs(table_len - last_ncols) <= 1:
+            # Continuation page — tolerate ±1 column difference (pdfplumber often
+            # detects one extra/missing column on continuation pages)
+            new_rows, current_row = _assemble_rows(table, -1, last_mapping, live_col_types, current_row)
+            all_rows.extend(new_rows)
 
-    return all_rows, headers_detected, unmapped_headers
+    return all_rows, headers_detected, unmapped_headers, current_row
 
 
 # ── Generic parser ──────────────────────────────────────────────────────────
@@ -629,10 +640,10 @@ def parse_pdf(file_bytes: bytes, password: str = "", fieldmap_rows: list = None,
     if candidates:
         for label, assembled in candidates:
             logger.info(f"[Parser] strategy={label}: rows={len(assembled[0])}, cells={sum(len(r) for r in assembled[0])}")
-        best_label, (rows, headers_detected, unmapped_headers) = max(
+        best_label, (rows, headers_detected, unmapped_headers, _) = max(
             candidates, key=_cand_score)
         if not rows:
-            best_label, (rows, headers_detected, unmapped_headers) = max(
+            best_label, (rows, headers_detected, unmapped_headers, _) = max(
                 candidates, key=lambda c: len(c[1][0]))
         logger.info(f"[Parser] selected strategy={best_label}, rows={len(rows)}")
 
@@ -654,7 +665,7 @@ def parse_pdf(file_bytes: bytes, password: str = "", fieldmap_rows: list = None,
     # Table rows already have fieldmap fieldnames as keys — those pass through unchanged.
     # Build category→fieldname mapping from fieldmap's display names.
     _category_map = {}
-    for alias, fieldname in (alias_map or {}).items():
+    for _, fieldname in (alias_map or {}).items():
         cat = _fieldname_category(fieldname)
         if cat and cat not in _category_map:
             _category_map[cat] = fieldname
@@ -692,11 +703,14 @@ def parse_pdf(file_bytes: bytes, password: str = "", fieldmap_rows: list = None,
         if new_row:
             normalized.append(new_row)
 
+    # Reconciliation: count date-like tokens in raw text for debugging
+    _date_tokens = re.findall(r"\b\d{1,2}[-/]\d{1,2}[-/]\d{2,4}\b", text)
+
     t4 = time.perf_counter()
     logger.info(
         f"[Parser] table: {(t2-t1)*1000:.0f}ms, assemble: {(t3-t2)*1000:.0f}ms, "
         f"normalize: {(t4-t3)*1000:.0f}ms, TOTAL: {(t4-t0)*1000:.0f}ms, "
-        f"rows={len(normalized)}"
+        f"rows={len(normalized)}, dates_in_text={len(_date_tokens)}"
     )
 
     return {
@@ -705,6 +719,9 @@ def parse_pdf(file_bytes: bytes, password: str = "", fieldmap_rows: list = None,
         "headers_detected": headers_detected,
         "unmapped_headers": unmapped_headers,
         "raw_text": text[:2000],
+        "stats": {
+            "dates_in_raw_text": len(_date_tokens),
+        },
     }
 
 
@@ -729,11 +746,12 @@ def _parse_rows_fallback(text: str) -> list:
     amt_pattern = re.compile(r"(-?[\d,]+\.\d{2})")
     amt_triple = re.compile(r"([\d,]+\.\d{2})\s+([\d,]+\.\d{2})\s+([\d,]+\.\d{2})")
 
-    skip_keywords = [
-        "PAGE", "Statement", "Customer", "Account", "Branch",
-        "IFSC", "MICR", "Customer ID", "Nomination", "Address",
-        "Date:", "Generated", "Registered", "Subject to",
-    ]
+    # Only skip obvious PDF boilerplate that could never be a transaction line.
+    # We no longer skip lines containing field names like IFSC, MICR, Branch,
+    # etc. — those could legitimately be custom fields added by the user.
+    _boilerplate = re.compile(
+        r"^(Page\s+\d+|Statement\s+of|Generated\s+on|Subject\s+to|Registered\s+office)"
+    )
 
     rows = []
     current_row = None
@@ -743,9 +761,9 @@ def _parse_rows_fallback(text: str) -> list:
         if not line:
             continue
 
-        if len(line) < 50:
-            if any(kw.lower() in line.lower() for kw in skip_keywords):
-                continue
+        # Skip only unmistakable boilerplate
+        if _boilerplate.match(line):
+            continue
 
         date_val = None
         date_end = 0
