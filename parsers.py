@@ -397,6 +397,127 @@ def _has_valid_date(row_cells: list, date_col_idx: int) -> bool:
     return bool(_parse_date_to_date(val))
 
 
+def _get_balance_val(row: dict, balance_fieldname: str) -> float | None:
+    """Extract a numeric balance from a row, or None."""
+    raw = row.get(balance_fieldname, "")
+    if not raw:
+        return None
+    try:
+        return float(str(raw).replace(",", "").strip())
+    except (ValueError, TypeError):
+        return None
+
+
+def _repair_over_split_rows(rows: list, alias_map: dict) -> list:
+    """
+    Merge fragmented rows caused by over-splitting on date-like tokens in
+    continuation lines.
+
+    Pattern: a multi-line transaction gets split so that one fragment has
+    amounts+balance but empty description, and the preceding fragment has
+    a description but no amounts. We merge these back together.
+    Uses fieldmap to find actual column names for each category.
+    """
+    if len(rows) < 2:
+        return rows
+
+    # Resolve category → fieldname from fieldmap
+    _cat = {}
+    for _, fn in (alias_map or {}).items():
+        cat = _fieldname_category(fn)
+        if cat and cat not in _cat:
+            _cat[cat] = fn
+    bal_fn = _cat.get("balance", "balance")
+    dep_fn = _cat.get("deposits", "deposits")
+    wdr_fn = _cat.get("withdrawal", "withdrawal")
+    desc_fn = _cat.get("description", "desc")
+
+    repaired = []
+    i = 0
+    while i < len(rows):
+        r = rows[i]
+        if i + 1 < len(rows):
+            next_r = rows[i + 1]
+            r_has_desc = bool(r.get(desc_fn))
+            r_no_amt = not _row_has_amount(r, wdr_fn, dep_fn)
+            n_has_amt = _row_has_amount(next_r, wdr_fn, dep_fn)
+            n_has_bal = _get_balance_val(next_r, bal_fn) is not None
+            n_empty_desc = not bool(next_r.get(desc_fn))
+
+            if r_has_desc and r_no_amt and n_has_amt and n_has_bal and n_empty_desc:
+                merged = dict(r)
+                for key, val in next_r.items():
+                    if val and not merged.get(key):
+                        merged[key] = val
+                repaired.append(merged)
+                i += 2
+                continue
+
+        repaired.append(r)
+        i += 1
+
+    return repaired
+
+
+def _row_has_amount(row: dict, wdr_fn: str, dep_fn: str) -> bool:
+    """Check if a row has a non-zero withdrawal or deposit."""
+    for key in (wdr_fn, dep_fn):
+        raw = row.get(key, "")
+        if not raw:
+            continue
+        try:
+            if float(str(raw).replace(",", "")) != 0.0:
+                return True
+        except (ValueError, TypeError):
+            pass
+    return False
+
+
+def _score_balance_chain(rows: list, alias_map: dict) -> tuple:
+    """
+    Score a list of assembled rows by how well they chain via balance checksums.
+
+    For each row i:  balance_i == balance_{i-1} + deposits_i - withdrawal_i
+
+    Uses fieldmap to find actual column names for each category.
+    Returns (consecutive_chain_length, complete_rows).
+    """
+    _cat = {}
+    for _, fn in (alias_map or {}).items():
+        cat = _fieldname_category(fn)
+        if cat and cat not in _cat:
+            _cat[cat] = fn
+    bal_fn = _cat.get("balance", "balance")
+    dep_fn = _cat.get("deposits", "deposits")
+    wdr_fn = _cat.get("withdrawal", "withdrawal")
+
+    prev_bal = None
+    chain_len = 0
+    complete_rows = 0
+
+    for r in rows:
+        bal = _get_balance_val(r, bal_fn)
+        dep_raw = r.get(dep_fn, "")
+        wdr_raw = r.get(wdr_fn, "")
+        has_date = bool(r.get("date"))
+        try:
+            dep_val = float(str(dep_raw).replace(",", "")) if dep_raw else 0.0
+            wdr_val = float(str(wdr_raw).replace(",", "")) if wdr_raw else 0.0
+            has_amount = (dep_val != 0.0 or wdr_val != 0.0)
+        except (ValueError, TypeError):
+            has_amount = False
+
+        if has_date and has_amount and bal is not None:
+            complete_rows += 1
+            if prev_bal is not None:
+                expected = prev_bal + dep_val - wdr_val
+                if abs(expected - bal) < 0.02:
+                    chain_len += 1
+            prev_bal = bal
+
+    return chain_len, complete_rows
+
+
 def _assemble_rows(table_rows: list, header_idx: int, col_mapping: dict,
                     live_col_types: dict = None, current_row=None) -> tuple:
     """
@@ -417,6 +538,7 @@ def _assemble_rows(table_rows: list, header_idx: int, col_mapping: dict,
     live_col_types = live_col_types or {}
     date_cols = []        # anchor columns — a valid date in ANY starts a new row
     text_cols = set()     # text columns — receive continuation lines
+    balance_fieldname = "balance"  # default; overridden below if found
 
     for col_idx, fieldname in col_mapping.items():
         col_type = (live_col_types.get(fieldname) or "").lower()
@@ -424,6 +546,9 @@ def _assemble_rows(table_rows: list, header_idx: int, col_mapping: dict,
             date_cols.append(col_idx)
         elif col_type in ("text", "character varying", "varchar"):
             text_cols.add(col_idx)
+        elif col_type in ("real", "double precision", "numeric", "integer", "bigint"):
+            if _fieldname_category(fieldname) == "balance":
+                balance_fieldname = fieldname
 
     # Fallback: if no date column found by type, use fieldname heuristics
     if not date_cols:
@@ -441,11 +566,16 @@ def _assemble_rows(table_rows: list, header_idx: int, col_mapping: dict,
 
         row_cells = [str(c).strip() if c else "" for c in row_cells]
 
-        # A row with a valid date in ANY anchor column is always a transaction —
-        # even if its text matches a footer keyword (e.g. "B/F" opening-balance
-        # rows). Checking every date column tolerates cells lost to imperfect
-        # column-boundary detection.
-        if any(_has_valid_date(row_cells, dc) for dc in date_cols):
+        # A row with a valid date in ANY anchor column normally starts a new
+        # transaction. But if the current row is still incomplete (missing its
+        # balance), treat the date as a continuation (e.g. value date on a
+        # second line) rather than a new transaction. This prevents over-splitting
+        # multi-line transactions into fragments.
+        current_balance = current_row.get(balance_fieldname) if current_row else None
+        has_balance = bool(current_balance and _get_balance_val(current_row, balance_fieldname) is not None)
+        date_starts_new = not current_row or not has_balance
+
+        if any(_has_valid_date(row_cells, dc) for dc in date_cols) and date_starts_new:
             if current_row:
                 rows.append(current_row)
 
@@ -633,8 +763,10 @@ def parse_pdf(file_bytes: bytes, password: str = "", fieldmap_rows: list = None,
     def _cand_score(cand):
         cand_rows = cand[1][0]
         if _has_merged_rows(cand_rows):
-            return (0, 0)  # merged-row signature — only wins if nothing else does
-        return (len(cand_rows), sum(len(r) for r in cand_rows))
+            return (0, 0, 0)  # merged-row signature — only wins if nothing else does
+        chain_len, complete_rows = _score_balance_chain(cand_rows, alias_map)
+        # Primary: balance chain length (correctness), secondary: complete rows, tertiary: total rows
+        return (chain_len, complete_rows, len(cand_rows))
 
     rows, headers_detected, unmapped_headers = [], {}, []
     if candidates:
@@ -646,6 +778,15 @@ def parse_pdf(file_bytes: bytes, password: str = "", fieldmap_rows: list = None,
             best_label, (rows, headers_detected, unmapped_headers, _) = max(
                 candidates, key=lambda c: len(c[1][0]))
         logger.info(f"[Parser] selected strategy={best_label}, rows={len(rows)}")
+
+    # Repair pass: merge fragmented rows where a date-bearing line split a
+    # multi-line transaction. A row with amounts but empty description merges
+    # with the preceding fragment that has a description but no amounts —
+    # only if the balance equation still holds after merge.
+    repaired = _repair_over_split_rows(rows, "balance")
+    if len(repaired) != len(rows):
+        logger.info(f"[Parser] repair: merged {len(rows) - len(repaired)} over-split rows ({len(rows)} → {len(repaired)})")
+        rows = repaired
 
     t2 = time.perf_counter()
 
