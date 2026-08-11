@@ -34,6 +34,10 @@ app = FastAPI(title="DPL Data Bank API", lifespan=lifespan)
 app.add_middleware(
     CORSMiddleware,
     allow_origins=["https://dpl-f.vercel.app", "https://dpl-project.onrender.com"],
+    # Vercel preview deployments get a random-hash subdomain per branch/PR
+    # (e.g. dpl-iyf6mt7dt-dpl-project-xxx.vercel.app) — those can't be
+    # listed individually, so match any *.vercel.app URL for this project.
+    allow_origin_regex=r"^https://dpl(-[a-zA-Z0-9]+)*\.vercel\.app$",
     allow_credentials=True,
     allow_methods=["*"],
     allow_headers=["*"],
