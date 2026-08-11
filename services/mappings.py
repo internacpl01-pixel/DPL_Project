@@ -30,15 +30,14 @@ async def get_field_mappings() -> list:
 
 
 async def get_table_structure() -> list:
-    rows = await Database.fetch("""
-        SELECT column_name, data_type, is_nullable
-        FROM information_schema.columns
-        WHERE table_name = 'master'
-        ORDER BY ordinal_position
-    """)
+    """Same underlying query as services.data.get_live_columns — routed
+    through its cache instead of re-querying information_schema directly.
+    Response shape is unchanged (column_name/data_type/is_nullable keys)."""
+    from services.data import get_live_columns
+    live_cols = await get_live_columns()
     return [
-        {"column_name": r["column_name"], "data_type": r["data_type"], "is_nullable": r["is_nullable"]}
-        for r in rows
+        {"column_name": c["name"], "data_type": c["type"], "is_nullable": c["nullable"]}
+        for c in live_cols
     ]
 
 
@@ -63,11 +62,10 @@ async def log_field_change(fieldname: str, table_row_id: int, table_name: str):
 
 
 async def update_field_mapping(fieldname: str, displayname: str, mapfields: str):
-    await Database.execute(
-        "UPDATE fieldmap SET displayname=$1, mapfields=$2 WHERE fieldname=$3",
+    record = await Database.fetchrow(
+        "UPDATE fieldmap SET displayname=$1, mapfields=$2 WHERE fieldname=$3 RETURNING id",
         displayname, mapfields, fieldname,
     )
     _invalidate_field_mappings_cache()
-    record = await Database.fetchrow("SELECT id FROM fieldmap WHERE fieldname=$1", fieldname)
     if record:
         await log_field_change(fieldname, record["id"], "fieldmap")

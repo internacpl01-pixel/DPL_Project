@@ -47,48 +47,27 @@ def _parse_date_to_date(val) -> _date | None:
     return None
 
 
-def resolve_field_map(fieldmap_rows: list) -> dict:
-    """Build {normalized_alias: fieldname} from fieldmap rows."""
-    alias_map = {}
-    for row in fieldmap_rows:
-        fieldname = row.get("fieldname", "")
-        mapfields = row.get("mapfields", "")
-        if not mapfields:
-            continue
-        for alias in mapfields.split(","):
-            alias = alias.strip().lower()
-            if alias:
-                alias_map[alias] = fieldname
-    return alias_map
-
-
-def resolve_column(header_name: str, alias_map: dict) -> str:
-    """Map a PDF column header to a canonical master fieldname."""
-    cleaned = header_name.strip().lower()
-    if cleaned in alias_map:
-        return alias_map[cleaned]
-    normalized = re.sub(r"[^\w\s]", "", cleaned).strip()
-    if normalized in alias_map:
-        return alias_map[normalized]
-    return cleaned
-
-
-async def append_rows_to_master(conn, rows: list, fieldmap_rows: list) -> int:
+async def append_rows_to_master(conn, rows: list, fieldmap_rows: list, live_cols: dict = None) -> int:
     """
     Insert parsed rows into master table.
     Row keys are already fieldmap fieldnames (master column names).
     Type-aware coercion: dates → DATE, numerics → REAL, rest → TEXT.
     Chunked INSERTs stay under asyncpg's 32,767 parameter limit.
+
+    live_cols: optional {column_name: data_type} map. Callers that already
+    fetched this (pdf_import.py, excel_import.py) can pass it through to
+    skip a duplicate information_schema query. Falls back to querying it
+    here when not provided, so existing callers are unaffected.
     """
     if not rows:
         return 0
 
-    # Get live columns and their types from information_schema
-    live_col_rows = await conn.fetch(
-        "SELECT column_name, data_type FROM information_schema.columns "
-        "WHERE table_name = 'master' ORDER BY ordinal_position"
-    )
-    live_cols = {r["column_name"]: r["data_type"] for r in live_col_rows}
+    if live_cols is None:
+        live_col_rows = await conn.fetch(
+            "SELECT column_name, data_type FROM information_schema.columns "
+            "WHERE table_name = 'master' ORDER BY ordinal_position"
+        )
+        live_cols = {r["column_name"]: r["data_type"] for r in live_col_rows}
 
     # Collect all column keys from rows, filter to live columns only
     all_keys = set()
@@ -165,3 +144,18 @@ async def append_rows_to_master(conn, rows: list, fieldmap_rows: list) -> int:
         _invalidate_total_count_cache()
 
     return total_inserted
+
+
+def compute_fill_rates(rows: list) -> dict:
+    """Per-field fill rate: how many of the assembled rows have a value for
+    each key. Shared by the PDF and Excel import paths (identical logic)."""
+    total_rows = len(rows)
+    if not total_rows:
+        return {}
+    all_keys = set()
+    for r in rows:
+        all_keys.update(r.keys())
+    return {
+        key: {"filled": sum(1 for r in rows if r.get(key)), "total": total_rows}
+        for key in sorted(all_keys)
+    }

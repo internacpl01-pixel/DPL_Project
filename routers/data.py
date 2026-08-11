@@ -2,7 +2,7 @@
 from fastapi import APIRouter, Depends, HTTPException, status
 
 from schemas import AddDataRequest
-from dependencies import get_current_user
+from dependencies import get_current_user, require_level
 from database import Database
 from services.data import get_master_rows, insert_master_rows_bulk, delete_master_row, truncate_master
 
@@ -29,7 +29,7 @@ async def add_data(body: AddDataRequest, current_user: dict = Depends(get_curren
 
 
 @router.delete("/data/{row_id}")
-async def delete_data(row_id: int, current_user: dict = Depends(get_current_user)):
+async def delete_data(row_id: int, current_user: dict = Depends(require_level(1, 2))):
     deleted = await delete_master_row(row_id)
     if deleted:
         return {"message": f"Row {row_id} deleted"}
@@ -37,6 +37,6 @@ async def delete_data(row_id: int, current_user: dict = Depends(get_current_user
 
 
 @router.delete("/data")
-async def truncate_data(current_user: dict = Depends(get_current_user)):
+async def truncate_data(current_user: dict = Depends(require_level(1, 2))):
     count = await truncate_master()
     return {"message": f"All data deleted ({count} rows remaining)", "deleted": True}

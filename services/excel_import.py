@@ -114,21 +114,14 @@ async def process_excel_import(file_bytes: bytes, save: bool = False):
                 r.setdefault(fn, val)
 
     # Per-field fill rates
-    total_rows = len(assembled)
-    fill_rates = {}
-    if total_rows:
-        all_keys = set()
-        for r in assembled:
-            all_keys.update(r.keys())
-        for key in sorted(all_keys):
-            filled = sum(1 for r in assembled if r.get(key))
-            fill_rates[key] = {"filled": filled, "total": total_rows}
+    from import_helpers import compute_fill_rates
+    fill_rates = compute_fill_rates(assembled)
 
     inserted_count = 0
     if save and assembled:
         async with Database.acquire() as conn:
             from import_helpers import append_rows_to_master
-            inserted_count = await append_rows_to_master(conn, assembled, fieldmap_rows)
+            inserted_count = await append_rows_to_master(conn, assembled, fieldmap_rows, live_cols=live_col_types)
 
     t_total = (time.perf_counter() - t_start) * 1000
     logger.info(f"[Excel] TOTAL: {t_total:.0f}ms, rows={len(assembled)}, inserted={inserted_count}")

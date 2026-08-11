@@ -1,5 +1,4 @@
 """DPL Data Bank API — async FastAPI entry point."""
-import os
 import logging
 from pathlib import Path
 from contextlib import asynccontextmanager
@@ -11,7 +10,6 @@ from fastapi.staticfiles import StaticFiles
 
 from database import Database
 from services.schema_init import create_tables, insert_default_mappings, create_default_admin
-from services.auth import register_user
 
 from routers import auth, users, mappings, data, imports
 
@@ -35,7 +33,7 @@ app = FastAPI(title="DPL Data Bank API", lifespan=lifespan)
 
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=["*"],
+    allow_origins=["https://dpl-f.vercel.app", "https://dpl-project.onrender.com"],
     allow_credentials=True,
     allow_methods=["*"],
     allow_headers=["*"],

@@ -63,6 +63,7 @@ async def get_master_rows(limit: int = 50, offset: int = 0) -> dict:
 
     live_cols = await get_live_columns()
     col_names = [c["name"] for c in live_cols]
+    type_map = {c["name"]: c["type"] for c in live_cols}
 
     # Build fieldname -> displayname map
     fieldmap_rows = await get_field_mappings()
@@ -86,7 +87,7 @@ async def get_master_rows(limit: int = 50, offset: int = 0) -> dict:
     return {
         "rows": result_rows,
         "columns": [
-            {"name": c, "displayname": display_map.get(c, c), "type": ""}
+            {"name": c, "displayname": display_map.get(c, c), "type": type_map.get(c, "")}
             for c in col_names
         ],
         "page": (offset // limit) + 1,
