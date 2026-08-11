@@ -40,6 +40,11 @@ async def get_master_rows(limit: int = 50, offset: int = 0) -> dict:
 
     live_cols = await get_live_columns()
     col_names = [c["name"] for c in live_cols]
+
+    # Build fieldname -> displayname map
+    fieldmap_rows = await get_field_mappings()
+    display_map = {r["fieldname"]: r.get("displayname", r["fieldname"]) for r in fieldmap_rows}
+
     cols_str = ", ".join(f'"{c}"' if c == "desc" else c for c in col_names)
 
     rows = await Database.fetch(
@@ -57,7 +62,10 @@ async def get_master_rows(limit: int = 50, offset: int = 0) -> dict:
     )
     return {
         "rows": result_rows,
-        "columns": [{"name": c, "type": ""} for c in col_names],
+        "columns": [
+            {"name": c, "displayname": display_map.get(c, c), "type": ""}
+            for c in col_names
+        ],
         "page": (offset // limit) + 1,
         "limit": limit,
         "total": total,

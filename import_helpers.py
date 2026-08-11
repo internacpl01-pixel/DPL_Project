@@ -120,7 +120,7 @@ async def append_rows_to_master(conn, rows: list, fieldmap_rows: list) -> int:
                 try:
                     cleaned = str(val).replace(",", "").strip()
                     if cleaned:
-                        row_vals[col_indices[col]] = float(cleaned)
+                        row_vals[col_indices[col]] = round(float(cleaned), 2)
                 except (ValueError, TypeError):
                     continue
             else:

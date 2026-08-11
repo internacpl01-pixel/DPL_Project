@@ -165,10 +165,11 @@ async def create_custom_field(body: CustomFieldRequest, current_user: dict = Dep
         _invalidate_live_cols_cache()
         # Also invalidate fieldmap cache (the new fieldmap row won't be visible until TTL expires)
         _invalidate_field_mappings_cache()
+        display_name = body.displayname.strip() if body.displayname.strip() else col_name
         await conn.execute(
             "INSERT INTO fieldmap (fieldname, displayname, mapfields) VALUES ($1, $2, $3) "
             "ON CONFLICT (fieldname) DO UPDATE SET displayname=EXCLUDED.displayname, mapfields=EXCLUDED.mapfields",
-            col_name, col_name, col_name,
+            col_name, display_name, col_name,
         )
 
     return {"column": col_name, "type": sql_type}

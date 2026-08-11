@@ -33,6 +33,7 @@ class UpdateMappingRequest(BaseModel):
 
 class CustomFieldRequest(BaseModel):
     type: FieldType
+    displayname: str = Field("", description="Human-readable name for the field")
 
 
 class AddUserRequest(BaseModel):
