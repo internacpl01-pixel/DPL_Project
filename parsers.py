@@ -166,15 +166,36 @@ def _normalize_for_matching(s: str) -> str:
 
 
 def _build_alias_map(fieldmap_rows: list) -> dict:
-    """Build {normalized_alias: fieldname} from fieldmap rows."""
+    """Build {normalized_alias: fieldname} from fieldmap rows.
+
+    Aliases come from three sources:
+      • mapfields  — user-supplied aliases (PDF header text, bank-specific names)
+      • displayname — human-readable name (e.g. "Account No")
+      • fieldname  — the actual DB column name (e.g. "field_num_1")
+
+    All three are normalized and added to the alias map so header matching
+    works even with no custom configuration.
+    """
     alias_map = {}
     for row in (fieldmap_rows or []):
         fieldname = row.get("fieldname", "")
+        displayname = row.get("displayname", "")
         mapfields = row.get("mapfields", "")
+
+        # Collect all alias candidates for this field
+        candidates = set()
+        if displayname:
+            candidates.add(displayname)
+        if fieldname:
+            candidates.add(fieldname)
         for alias in mapfields.split(","):
             alias = alias.strip()
             if alias:
-                norm = _normalize_for_matching(alias)
+                candidates.add(alias)
+
+        for alias in candidates:
+            norm = _normalize_for_matching(alias)
+            if norm:
                 alias_map[norm] = fieldname
     return alias_map
 

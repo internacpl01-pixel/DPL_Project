@@ -54,6 +54,17 @@ async def process_pdf_import(file_bytes: bytes, save: bool = False, password: st
             t_ins = (time.perf_counter() - t1) * 1000
             logger.info(f"[PDF] insert: {t_ins:.0f}ms, count={inserted_count}")
 
+    # Per-field fill rates: how many rows have a value for each known column
+    total_rows = len(rows)
+    fill_rates = {}
+    if total_rows:
+        all_keys = set()
+        for r in rows:
+            all_keys.update(r.keys())
+        for key in sorted(all_keys):
+            filled = sum(1 for r in rows if r.get(key))
+            fill_rates[key] = {"filled": filled, "total": total_rows}
+
     t_total = (time.perf_counter() - t_start) * 1000
     logger.info(f"[PDF] TOTAL: {t_total:.0f}ms")
     return {
@@ -63,4 +74,5 @@ async def process_pdf_import(file_bytes: bytes, save: bool = False, password: st
         "headers_detected": headers_detected,
         "unmapped_headers": unmapped_headers,
         "stats": stats,
+        "fill_rates": fill_rates,
     }

@@ -222,6 +222,17 @@ async def process_excel_import(file_bytes: bytes, save: bool = False):
 
     assembled = _assemble_excel_rows(rows, header_idx, col_mapping, live_col_types)
 
+    # Per-field fill rates
+    total_rows = len(assembled)
+    fill_rates = {}
+    if total_rows:
+        all_keys = set()
+        for r in assembled:
+            all_keys.update(r.keys())
+        for key in sorted(all_keys):
+            filled = sum(1 for r in assembled if r.get(key))
+            fill_rates[key] = {"filled": filled, "total": total_rows}
+
     inserted_count = 0
     if save and assembled:
         async with Database.acquire() as conn:
@@ -237,5 +248,6 @@ async def process_excel_import(file_bytes: bytes, save: bool = False):
         "inserted": inserted_count,
         "headers_detected": headers_detected,
         "unmapped_headers": unmapped_headers,
-        "stats": {"dates_in_raw_text": 0},  # not tracked for Excel yet
+        "stats": {"dates_in_raw_text": 0},
+        "fill_rates": fill_rates,
     }
