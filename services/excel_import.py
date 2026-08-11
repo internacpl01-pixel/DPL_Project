@@ -1,175 +1,50 @@
 """Excel import service — reads .xlsx/.xls bank statements and appends to master.
 
-Uses the same fieldmap + live-column-types pipeline as the PDF importer,
-so column mapping, type coercion, and chunked INSERTs are identical.
+Uses the same fieldmap + live-column-types pipeline as the PDF importer.
+Header detection and row assembly are shared with parsers.py, so column
+mapping, row boundaries, type coercion, and chunked INSERTs behave
+identically for PDF and Excel.
 """
 from __future__ import annotations
 
 import logging
-import re
 import time
+from datetime import date, datetime
+from io import BytesIO
+
 import openpyxl
 
 from services.mappings import get_field_mappings
 from database import Database
-from parsers import _build_alias_map, _fieldname_category, _parse_date
+from parsers import _build_alias_map, _detect_header_row, _assemble_rows
 
 logger = logging.getLogger(__name__)
 
 
 def _read_excel_rows(file_bytes: bytes) -> list:
-    """Read all rows from an Excel file (first sheet only)."""
-    from io import BytesIO
+    """Read all rows from an Excel file (first sheet only).
+
+    Date/datetime cells are converted to ISO date strings so date detection
+    and type coercion work exactly as they do for PDF-extracted text
+    (str(datetime) would otherwise yield "2026-08-04 00:00:00", which the
+    date detectors reject).
+    """
     wb = openpyxl.load_workbook(BytesIO(file_bytes), read_only=True, data_only=True)
     ws = wb.active
     rows = []
     for row in ws.iter_rows(values_only=True):
-        cells = [str(c).strip() if c is not None else "" for c in row]
+        cells = []
+        for c in row:
+            if c is None:
+                cells.append("")
+            elif isinstance(c, (datetime, date)):
+                cells.append(c.strftime("%Y-%m-%d"))
+            else:
+                cells.append(str(c).strip())
         if any(cells):  # skip completely empty rows
             rows.append(cells)
     wb.close()
     return rows
-
-
-def _match_alias(header_text: str, alias_map: dict):
-    """Try to match a header cell against the alias map.
-    Returns (matched_alias, fieldname) or (None, None).
-    """
-    cleaned = header_text.strip().lower()
-    if cleaned in alias_map:
-        return cleaned, alias_map[cleaned]
-    normalized = re.sub(r"[^\w\s]", "", cleaned).strip()
-    if normalized in alias_map:
-        return normalized, alias_map[normalized]
-    return None, None
-
-
-def _detect_header_row(rows: list, alias_map: dict) -> tuple:
-    """Find the header row by matching >=2 cells against fieldmap aliases.
-    Returns (header_index, {col_idx: fieldname}).
-    """
-    for idx, row in enumerate(rows):
-        mapping = {}
-        for col_idx, cell in enumerate(row):
-            if not cell:
-                continue
-            matched = _match_alias(cell, alias_map)
-            if matched[0]:
-                mapping[col_idx] = matched[1]
-        if len(mapping) >= 2:
-            return idx, mapping
-    return -1, {}
-
-
-def _looks_like_date(val) -> bool:
-    """Quick check if a cell value looks like a date."""
-    s = str(val).strip()
-    if not s:
-        return False
-    date_patterns = [
-        re.compile(r"^\d{4}-\d{2}-\d{2}$"),
-        re.compile(r"^\d{1,2}/\d{1,2}/\d{4}$"),
-        re.compile(r"^\d{1,2}-\d{1,2}-\d{4}$"),
-        re.compile(r"^\d{1,2}-[A-Za-z]{3}-\d{4}$"),
-    ]
-    for pat in date_patterns:
-        if pat.match(s):
-            return True
-    return False
-
-
-def _assemble_excel_rows(rows: list, header_idx: int, col_mapping: dict,
-                         live_col_types: dict) -> list:
-    """Assemble transaction rows from Excel table data.
-    Row keys = fieldmap fieldnames. Column roles come from information_schema types.
-    """
-    date_cols = []
-    text_cols = set()
-
-    for col_idx, fieldname in col_mapping.items():
-        col_type = (live_col_types.get(fieldname) or "").lower()
-        if col_type in ("date", "timestamp without time zone", "timestamp"):
-            date_cols.append(col_idx)
-        elif col_type in ("text", "character varying", "varchar"):
-            text_cols.add(col_idx)
-
-    if not date_cols:
-        for col_idx, fieldname in col_mapping.items():
-            if fieldname.lower() in ("date", "value_date", "entry_date", "tran_date", "txn_date"):
-                date_cols.append(col_idx)
-
-    _FOOTER_KEYWORDS = {
-        "total", "closing balance", "b/f", "c/f", "b/fwd", "c/fwd",
-        "opening balance", "summary", "grand total", "page",
-    }
-
-    result = []
-    current_row = None
-
-    def _row_started():
-        return current_row is not None
-
-    for row_idx in range(header_idx + 1, len(rows)):
-        row_cells = rows[row_idx]
-        if not row_cells:
-            continue
-
-        # Pad to same length as header
-        while len(row_cells) < len(rows[header_idx]):
-            row_cells.append("")
-
-        # A row with a valid date in ANY anchor column is always a transaction —
-        # even if its text matches a footer keyword (e.g. "B/F" opening-balance rows).
-        if any(dc < len(row_cells) and _looks_like_date(row_cells[dc]) for dc in date_cols):
-            if _row_started():
-                result.append(current_row)
-
-            current_row = {}
-            for col_idx, cell in enumerate(row_cells):
-                fieldname = col_mapping.get(col_idx)
-                if not fieldname or not cell:
-                    continue
-                current_row[fieldname] = cell
-
-        else:
-            # Date-less rows: footer/summary rows end the current transaction
-            # and must not leak into its description.
-            is_footer = False
-            for col_idx in text_cols:
-                if col_idx < len(row_cells):
-                    cell_lower = row_cells[col_idx].lower()
-                    for kw in _FOOTER_KEYWORDS:
-                        if kw == cell_lower or cell_lower.startswith(kw):
-                            is_footer = True
-                            break
-                if is_footer:
-                    break
-            if is_footer:
-                if _row_started():
-                    result.append(current_row)
-                    current_row = None
-                continue
-
-            if _row_started():
-                # Text columns append; other mapped columns fill only if empty
-                for col_idx, cell in enumerate(row_cells):
-                    if not cell:
-                        continue
-                    fieldname = col_mapping.get(col_idx)
-                    if not fieldname:
-                        continue
-                    if col_idx in text_cols:
-                        if current_row.get(fieldname):
-                            current_row[fieldname] += " " + cell
-                        else:
-                            current_row[fieldname] = cell
-                    elif not current_row.get(fieldname):
-                        current_row[fieldname] = cell
-
-    if _row_started():
-        result.append(current_row)
-
-    return result
 
 
 async def process_excel_import(file_bytes: bytes, save: bool = False):
@@ -199,7 +74,7 @@ async def process_excel_import(file_bytes: bytes, save: bool = False):
 
     header_idx, col_mapping = _detect_header_row(rows, alias_map)
 
-    if header_idx < 0:
+    if header_idx < 0 or not col_mapping:
         return {
             "rows": [],
             "row_count": 0,
@@ -220,7 +95,9 @@ async def process_excel_import(file_bytes: bytes, save: bool = False):
         if cell_str and col_idx not in col_mapping:
             unmapped_headers.append(cell_str)
 
-    assembled = _assemble_excel_rows(rows, header_idx, col_mapping, live_col_types)
+    assembled, carry = _assemble_rows(rows, header_idx, col_mapping, live_col_types)
+    if carry:
+        assembled.append(carry)
 
     # Per-field fill rates
     total_rows = len(assembled)

@@ -120,10 +120,15 @@ def _parse_date(val) -> str:
     # Already ISO
     if re.match(r"\d{4}-\d{2}-\d{2}", s):
         return s[:10]
-    # DD/MM/YYYY or DD-MM-YYYY
-    m = re.match(r"(\d{1,2})[/\-](\d{1,2})[/\-](\d{4})", s)
+    # DD/MM/YYYY, DD-MM-YYYY — also 2-digit years (DD/MM/YY → 20YY)
+    m = re.match(r"(\d{1,2})[/\-](\d{1,2})[/\-](\d{2,4})(?!\d)", s)
     if m:
-        return f"{m.group(3)}-{int(m.group(2)):02d}-{int(m.group(1)):02d}"
+        year = m.group(3)
+        if len(year) == 3:
+            return s  # ambiguous 3-digit year — leave unparsed
+        if len(year) == 2:
+            year = "20" + year
+        return f"{year}-{int(m.group(2)):02d}-{int(m.group(1)):02d}"
     # DD-Mon-YYYY or DD-Mon-YY
     m = re.match(r"(\d{1,2})-([A-Za-z]{3,})-(\d{2,4})", s)
     if m:
@@ -174,29 +179,25 @@ def _build_alias_map(fieldmap_rows: list) -> dict:
       • fieldname  — the actual DB column name (e.g. "field_num_1")
 
     All three are normalized and added to the alias map so header matching
-    works even with no custom configuration.
+    works even with no custom configuration. Explicit mapfields aliases take
+    priority; displayname/fieldname-derived aliases never overwrite an
+    existing entry (so a custom field displaynamed e.g. "Date" cannot
+    hijack a core column).
     """
     alias_map = {}
+    derived = []
     for row in (fieldmap_rows or []):
         fieldname = row.get("fieldname", "")
-        displayname = row.get("displayname", "")
-        mapfields = row.get("mapfields", "")
-
-        # Collect all alias candidates for this field
-        candidates = set()
-        if displayname:
-            candidates.add(displayname)
-        if fieldname:
-            candidates.add(fieldname)
-        for alias in mapfields.split(","):
-            alias = alias.strip()
-            if alias:
-                candidates.add(alias)
-
-        for alias in candidates:
+        for alias in (row.get("mapfields", "") or "").split(","):
             norm = _normalize_for_matching(alias)
             if norm:
                 alias_map[norm] = fieldname
+        for cand in (row.get("displayname", ""), fieldname):
+            norm = _normalize_for_matching(cand or "")
+            if norm:
+                derived.append((norm, fieldname))
+    for norm, fieldname in derived:
+        alias_map.setdefault(norm, fieldname)
     return alias_map
 
 
@@ -423,8 +424,11 @@ def _get_balance_val(row: dict, balance_fieldname: str) -> float | None:
     raw = row.get(balance_fieldname, "")
     if not raw:
         return None
+    cleaned = _clean_amount(str(raw))
+    if not cleaned:
+        return None
     try:
-        return float(str(raw).replace(",", "").strip())
+        return float(cleaned)
     except (ValueError, TypeError):
         return None
 
@@ -511,6 +515,7 @@ def _score_balance_chain(rows: list, alias_map: dict) -> tuple:
     bal_fn = _cat.get("balance", "balance")
     dep_fn = _cat.get("deposits", "deposits")
     wdr_fn = _cat.get("withdrawal", "withdrawal")
+    date_fn = _cat.get("date", "date")
 
     prev_bal = None
     chain_len = 0
@@ -520,10 +525,10 @@ def _score_balance_chain(rows: list, alias_map: dict) -> tuple:
         bal = _get_balance_val(r, bal_fn)
         dep_raw = r.get(dep_fn, "")
         wdr_raw = r.get(wdr_fn, "")
-        has_date = bool(r.get("date"))
+        has_date = bool(r.get(date_fn))
         try:
-            dep_val = float(str(dep_raw).replace(",", "")) if dep_raw else 0.0
-            wdr_val = float(str(wdr_raw).replace(",", "")) if wdr_raw else 0.0
+            dep_val = float(_clean_amount(str(dep_raw))) if dep_raw else 0.0
+            wdr_val = float(_clean_amount(str(wdr_raw))) if wdr_raw else 0.0
             has_amount = (dep_val != 0.0 or wdr_val != 0.0)
         except (ValueError, TypeError):
             has_amount = False
@@ -544,8 +549,9 @@ def _assemble_rows(table_rows: list, header_idx: int, col_mapping: dict,
     """
     Assemble transaction rows from table data using fieldmap + column types.
 
-    Returns (rows, current_row) so the caller can carry state across tables
-    (continuation pages, page-spanning transactions).
+    Returns (rows, current_row). The in-progress row is NOT flushed here —
+    the caller carries it into the next table (continuation pages,
+    page-spanning transactions) and flushes after the final table.
 
     Row keys = fieldmap fieldnames (not hardcoded names).
     Column roles come from information_schema data types:
@@ -553,32 +559,92 @@ def _assemble_rows(table_rows: list, header_idx: int, col_mapping: dict,
       • TEXT type     → text column (continuation lines + footer check)
       • NUMERIC type  → numeric column (amounts, cleaned)
 
-    Handles multi-line descriptions. Skips footer/summary rows.
+    Row boundaries, in priority order:
+      • dated line, open row complete → new transaction
+      • dated line, open row incomplete, but BOTH carry an amount → new
+        transaction (one transaction never has two amounts — covers layouts
+        where balance isn't printed on every row)
+      • dated line, open row incomplete otherwise → value-date continuation
+      • date-less line with an amount, open row complete → new transaction
+        inheriting the previous date (banks print the date once per
+        same-day group)
+      • date-less text line → description continuation
+
+    "Complete" = balance present; when no balance column is mapped,
+    a non-zero amount.
     """
     # Determine column roles from live column types
     live_col_types = live_col_types or {}
     date_cols = []        # anchor columns — a valid date in ANY starts a new row
     text_cols = set()     # text columns — receive continuation lines
-    balance_fieldname = "balance"  # default; overridden below if found
+    balance_fieldname = None
+    amount_fieldnames = []
+    date_fieldname = None
 
     for col_idx, fieldname in col_mapping.items():
         col_type = (live_col_types.get(fieldname) or "").lower()
+        cat = _fieldname_category(fieldname)
         if col_type in ("date", "timestamp without time zone", "timestamp"):
             date_cols.append(col_idx)
         elif col_type in ("text", "character varying", "varchar"):
             text_cols.add(col_idx)
         elif col_type in ("real", "double precision", "numeric", "integer", "bigint"):
-            if _fieldname_category(fieldname) == "balance":
+            if cat == "balance":
                 balance_fieldname = fieldname
+            elif cat in ("withdrawal", "deposits"):
+                amount_fieldnames.append(fieldname)
 
-    # Fallback: if no date column found by type, use fieldname heuristics
+    # Fallbacks when column types are unavailable: resolve roles by category
     if not date_cols:
         for col_idx, fieldname in col_mapping.items():
-            if fieldname.lower() in ("date", "value_date", "entry_date", "tran_date", "txn_date"):
+            if _fieldname_category(fieldname) == "date":
                 date_cols.append(col_idx)
+    if balance_fieldname is None:
+        for fieldname in col_mapping.values():
+            if _fieldname_category(fieldname) == "balance":
+                balance_fieldname = fieldname
+                break
+    if not amount_fieldnames:
+        for fieldname in col_mapping.values():
+            if _fieldname_category(fieldname) in ("withdrawal", "deposits"):
+                amount_fieldnames.append(fieldname)
+    for dc in date_cols:
+        if col_mapping.get(dc):
+            date_fieldname = col_mapping[dc]
+            break
+
+    def _num(val):
+        c = _clean_amount(str(val)) if val else ""
+        if not c:
+            return None
+        try:
+            return float(c)
+        except ValueError:
+            return None
+
+    def _dict_has_amount(row) -> bool:
+        if not row:
+            return False
+        return any(_num(row.get(fn)) not in (None, 0.0) for fn in amount_fieldnames)
+
+    def _line_has_amount(cells) -> bool:
+        for idx, cell in enumerate(cells):
+            fn = col_mapping.get(idx)
+            if fn in amount_fieldnames and cell and _num(cell) not in (None, 0.0):
+                return True
+        return False
+
+    def _row_complete(row) -> bool:
+        if not row:
+            return False
+        if balance_fieldname is not None:
+            return _get_balance_val(row, balance_fieldname) is not None
+        return _dict_has_amount(row)
 
     rows = []
-    current_row = current_row  # accept from caller (carried across tables)
+    last_date_val = None  # most recent transaction date, for same-day inheritance
+    if current_row and date_fieldname and current_row.get(date_fieldname):
+        last_date_val = current_row[date_fieldname]
 
     for row_idx in range(header_idx + 1, len(table_rows)):
         row_cells = table_rows[row_idx]
@@ -587,26 +653,17 @@ def _assemble_rows(table_rows: list, header_idx: int, col_mapping: dict,
 
         row_cells = [str(c).strip() if c else "" for c in row_cells]
 
-        # A row with a valid date in ANY anchor column normally starts a new
-        # transaction. But if the current row is still incomplete (missing its
-        # balance), treat the date as a continuation (e.g. value date on a
-        # second line) rather than a new transaction. This prevents over-splitting
-        # multi-line transactions into fragments.
-        current_balance = current_row.get(balance_fieldname) if current_row else None
-        has_balance = bool(current_balance and _get_balance_val(current_row, balance_fieldname) is not None)
-        date_starts_new = not current_row or not has_balance
+        line_dated = any(_has_valid_date(row_cells, dc) for dc in date_cols)
+        complete = _row_complete(current_row)
 
-        if any(_has_valid_date(row_cells, dc) for dc in date_cols) and date_starts_new:
-            if current_row:
-                rows.append(current_row)
-
-            current_row = {}
-            for col_idx, cell in enumerate(row_cells):
-                fieldname = col_mapping.get(col_idx)
-                if not fieldname or not cell:
-                    continue
-                current_row[fieldname] = cell
-
+        start_new = False
+        inherit_date = False
+        if line_dated:
+            if current_row is None or complete:
+                start_new = True
+            elif _line_has_amount(row_cells) and _dict_has_amount(current_row):
+                start_new = True
+            # else: value-date/continuation line of the open transaction
         else:
             # Date-less rows: footer/summary rows (TOTAL, Page N, ...) end the
             # current transaction and must not leak into its description.
@@ -622,33 +679,52 @@ def _assemble_rows(table_rows: list, header_idx: int, col_mapping: dict,
                     break
             if is_footer:
                 if current_row:
+                    if date_fieldname and current_row.get(date_fieldname):
+                        last_date_val = current_row[date_fieldname]
                     rows.append(current_row)
                     current_row = None
                 continue
 
+            if complete and _line_has_amount(row_cells):
+                start_new = True
+                inherit_date = True
+
+        if start_new:
             if current_row:
-                # Continuation row: text columns append; other mapped columns
-                # (amounts, dates) fill only if still empty — handles layouts
-                # where a value sits on a later line than the transaction date.
-                for col_idx, cell in enumerate(row_cells):
-                    if not cell:
-                        continue
-                    fieldname = col_mapping.get(col_idx)
-                    if not fieldname:
-                        continue
-                    if col_idx in text_cols:
-                        if current_row.get(fieldname):
-                            current_row[fieldname] += " " + cell
-                        else:
-                            current_row[fieldname] = cell
-                    elif not current_row.get(fieldname):
+                if date_fieldname and current_row.get(date_fieldname):
+                    last_date_val = current_row[date_fieldname]
+                rows.append(current_row)
+
+            current_row = {}
+            for col_idx, cell in enumerate(row_cells):
+                fieldname = col_mapping.get(col_idx)
+                if not fieldname or not cell:
+                    continue
+                current_row[fieldname] = cell
+            if inherit_date and date_fieldname and last_date_val and not current_row.get(date_fieldname):
+                current_row[date_fieldname] = last_date_val
+            if date_fieldname and current_row.get(date_fieldname):
+                last_date_val = current_row[date_fieldname]
+
+        elif current_row:
+            # Continuation row: text columns append; other mapped columns
+            # (amounts, dates) fill only if still empty — handles layouts
+            # where a value sits on a later line than the transaction date.
+            for col_idx, cell in enumerate(row_cells):
+                if not cell:
+                    continue
+                fieldname = col_mapping.get(col_idx)
+                if not fieldname:
+                    continue
+                if col_idx in text_cols:
+                    if current_row.get(fieldname):
+                        current_row[fieldname] += " " + cell
+                    else:
                         current_row[fieldname] = cell
+                elif not current_row.get(fieldname):
+                    current_row[fieldname] = cell
 
-    # Save last row
-    if current_row:
-        rows.append(current_row)
-        current_row = None
-
+    # In-progress row is intentionally NOT flushed — caller carries/flushes it.
     return rows, current_row
 
 
@@ -658,17 +734,29 @@ _DATE_TOKEN_RE = re.compile(
     r"\d{4}-\d{2}-\d{2}|\d{1,2}[/\-]\d{1,2}[/\-]\d{2,4}|\d{1,2}-[A-Za-z]{3,9}-\d{2,4}"
 )
 
+# A line that is purely an amount (numeric cell content) — used to detect
+# a numeric cell holding several stacked values.
+_AMOUNT_LINE_RE = re.compile(
+    r"^\s*(?:Rs\.?|INR|₹)?\s*-?[\d,]+\.\d{1,2}\s*(?:Dr|Cr)?\s*$", re.IGNORECASE
+)
+
 
 def _has_merged_rows(rows: list) -> bool:
     """
     Detect pdfplumber's 'merged row' failure: when row-separator lines aren't
-    found, all transactions collapse into one giant row whose cells hold many
-    newline-joined values (e.g. the date cell contains every date in the table).
+    found, transactions collapse into one giant row whose cells hold many
+    newline-joined values. Signatures: a cell containing ≥2 date tokens, or
+    a cell whose content is ≥2 stacked amount-only lines.
     """
     for r in rows:
         for v in r.values():
             s = str(v)
-            if "\n" in s and len(_DATE_TOKEN_RE.findall(s)) >= 2:
+            if "\n" not in s:
+                continue
+            if len(_DATE_TOKEN_RE.findall(s)) >= 2:
+                return True
+            amount_lines = sum(1 for ln in s.split("\n") if _AMOUNT_LINE_RE.match(ln))
+            if amount_lines >= 2:
                 return True
     return False
 
@@ -680,10 +768,11 @@ def _assemble_from_tables(tables: list, alias_map: dict, live_col_types: dict,
     Tables with a detectable header are parsed with their own column mapping;
     header-less tables (continuation pages) reuse the previous table's mapping.
 
-    Accepts and returns current_row so page-spanning transactions are preserved
-    across table boundaries.
+    current_row is carried across table boundaries so page-spanning
+    transactions keep their continuation lines; the final open row is
+    flushed here after the last table.
 
-    Returns (rows, headers_detected, unmapped_headers, current_row).
+    Returns (rows, headers_detected, unmapped_headers).
     """
     all_rows = []
     headers_detected = {}
@@ -717,7 +806,11 @@ def _assemble_from_tables(tables: list, alias_map: dict, live_col_types: dict,
             new_rows, current_row = _assemble_rows(table, -1, last_mapping, live_col_types, current_row)
             all_rows.extend(new_rows)
 
-    return all_rows, headers_detected, unmapped_headers, current_row
+    # Flush the final open transaction
+    if current_row:
+        all_rows.append(current_row)
+
+    return all_rows, headers_detected, unmapped_headers
 
 
 # ── Generic parser ──────────────────────────────────────────────────────────
@@ -793,19 +886,19 @@ def parse_pdf(file_bytes: bytes, password: str = "", fieldmap_rows: list = None,
     if candidates:
         for label, assembled in candidates:
             logger.info(f"[Parser] strategy={label}: rows={len(assembled[0])}, cells={sum(len(r) for r in assembled[0])}")
-        best_label, (rows, headers_detected, unmapped_headers, _) = max(
+        best_label, (rows, headers_detected, unmapped_headers) = max(
             candidates, key=_cand_score)
         if not rows:
-            best_label, (rows, headers_detected, unmapped_headers, _) = max(
+            best_label, (rows, headers_detected, unmapped_headers) = max(
                 candidates, key=lambda c: len(c[1][0]))
         logger.info(f"[Parser] selected strategy={best_label}, rows={len(rows)}")
 
     # Repair pass: merge fragmented rows where a date-bearing line split a
     # multi-line transaction. A row with amounts but empty description merges
     # with the preceding fragment that has a description but no amounts —
-    # only if the balance equation still holds after merge.
-    repaired = _repair_over_split_rows(rows, "balance")
-    if len(repaired) != len(rows):
+    # kept only if the balance chain doesn't get worse after the merge.
+    repaired = _repair_over_split_rows(rows, alias_map)
+    if len(repaired) != len(rows) and _score_balance_chain(repaired, alias_map) >= _score_balance_chain(rows, alias_map):
         logger.info(f"[Parser] repair: merged {len(rows) - len(repaired)} over-split rows ({len(rows)} → {len(repaired)})")
         rows = repaired
 
@@ -900,9 +993,8 @@ def _parse_rows_fallback(text: str) -> list:
 
     date_patterns = [
         re.compile(r"^(\d{4}-\d{2}-\d{2})"),
-        re.compile(r"^(\d{2}/\d{2}/\d{4})"),
-        re.compile(r"^(\d{2}-\d{2}-\d{4})"),
-        re.compile(r"^(\d{2}-[A-Za-z]{3}-\d{4})"),
+        re.compile(r"^(\d{1,2}[/\-]\d{1,2}[/\-]\d{2,4})(?!\d)"),
+        re.compile(r"^(\d{1,2}-[A-Za-z]{3}-\d{2,4})(?!\d)"),
     ]
 
     amt_pattern = re.compile(r"(-?[\d,]+\.\d{2})")
@@ -935,6 +1027,12 @@ def _parse_rows_fallback(text: str) -> list:
                 date_val = m.group(1)
                 date_end = m.end()
                 break
+
+        # A date-shaped token must also be a real calendar date (rejects
+        # e.g. "04/55/63" reference fragments at line start)
+        if date_val and not _parse_date_to_date(date_val):
+            date_val = None
+            date_end = 0
 
         if date_val:
             if current_row and current_row.get("date"):
