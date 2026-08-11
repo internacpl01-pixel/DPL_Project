@@ -129,8 +129,8 @@ def _parse_date(val) -> str:
         if len(year) == 2:
             year = "20" + year
         return f"{year}-{int(m.group(2)):02d}-{int(m.group(1)):02d}"
-    # DD-Mon-YYYY or DD-Mon-YY
-    m = re.match(r"(\d{1,2})-([A-Za-z]{3,})-(\d{2,4})", s)
+    # DD-Mon-YYYY, DD Mon YYYY, DD-Mon-YY (hyphen or space separated)
+    m = re.match(r"(\d{1,2})[\s\-]+([A-Za-z]{3,})[\s\-,]+(\d{2,4})", s)
     if m:
         month_map = {
             "jan": "01", "feb": "02", "mar": "03", "apr": "04",
@@ -321,6 +321,20 @@ def _extract_word_column_tables(file_bytes: bytes, alias_map: dict) -> list:
                     boundaries = [(a["x1"] + b["x0"]) / 2 for a, b in zip(cols, cols[1:])]
                     table = [[c["text"] for c in cols]]
                     start_li = best_li + 1
+                    # Multi-line headers: absorb following digit-free lines whose
+                    # phrases strongly match aliases (e.g. a stray "Date /
+                    # Reference No." fragment line under the main header line).
+                    while start_li < len(lines):
+                        frag_words = lines[start_li][1]
+                        joined = " ".join(w["text"] for w in frag_words)
+                        if any(ch.isdigit() for ch in joined):
+                            break
+                        confs = [_match_alias(p["text"], alias_map)[1]
+                                 for p in _merge_words_into_phrases(frag_words)]
+                        if confs and max(confs) >= 2:
+                            start_li += 1
+                        else:
+                            break
                 elif prev_boundaries:
                     boundaries = prev_boundaries
                     table = []
@@ -329,15 +343,44 @@ def _extract_word_column_tables(file_bytes: bytes, alias_map: dict) -> list:
                     continue
 
                 ncols = len(boundaries) + 1
-                for _, line_words in lines[start_li:]:
+
+                def _bucket(word_lines):
                     cells = [[] for _ in range(ncols)]
-                    for w in sorted(line_words, key=lambda w: float(w["x0"])):
-                        center = (float(w["x0"]) + float(w["x1"])) / 2
-                        idx = 0
-                        while idx < len(boundaries) and center > boundaries[idx]:
-                            idx += 1
-                        cells[idx].append(w["text"])
-                    table.append([" ".join(c) for c in cells])
+                    for lw in word_lines:
+                        for w in sorted(lw, key=lambda w: float(w["x0"])):
+                            center = (float(w["x0"]) + float(w["x1"])) / 2
+                            idx = 0
+                            while idx < len(boundaries) and center > boundaries[idx]:
+                                idx += 1
+                            cells[idx].append(w["text"])
+                    return [" ".join(c) for c in cells]
+
+                # Skip page boilerplate, then group multi-line transactions:
+                # a line carrying a date or amount token is an anchor (its own
+                # row); text-only fragment lines (wrapped descriptions — with
+                # vertically centered cells they sit above AND below the dated
+                # line) attach to the nearest anchor by y-distance.
+                body = []
+                for y, line_words in lines[start_li:]:
+                    joined = " ".join(w["text"] for w in sorted(line_words, key=lambda w: float(w["x0"])))
+                    if _BOILERPLATE_LINE_RE.search(joined):
+                        continue
+                    body.append((y, line_words))
+
+                anchor_idxs = [i for i, (_, lw) in enumerate(body)
+                               if _DATE_TOKEN_RE.search(" ".join(w["text"] for w in lw))
+                               or _AMOUNT_TOKEN_RE.search(" ".join(w["text"] for w in lw))]
+
+                if anchor_idxs:
+                    groups = {a: [] for a in anchor_idxs}
+                    for i, (y, lw) in enumerate(body):
+                        target = i if i in groups else min(anchor_idxs, key=lambda a: abs(body[a][0] - y))
+                        groups[target].append(lw)
+                    for a in anchor_idxs:
+                        table.append(_bucket(groups[a]))
+                else:
+                    for y, lw in body:
+                        table.append(_bucket([lw]))
 
                 if len(table) > 1 or (table and not boundaries):
                     tables.append(table)
@@ -652,6 +695,8 @@ def _assemble_rows(table_rows: list, header_idx: int, col_mapping: dict,
             continue
 
         row_cells = [str(c).strip() if c else "" for c in row_cells]
+        # "-" / "–" are empty-cell placeholders in many statements
+        row_cells = ["" if c in ("-", "–", "--") else c for c in row_cells]
 
         line_dated = any(_has_valid_date(row_cells, dc) for dc in date_cols)
         complete = _row_complete(current_row)
@@ -783,7 +828,18 @@ def _extract_document_level_fields(text: str, fieldmap_rows: list, filled_fields
 # ── Multi-table assembly ────────────────────────────────────────────────────
 
 _DATE_TOKEN_RE = re.compile(
-    r"\d{4}-\d{2}-\d{2}|\d{1,2}[/\-]\d{1,2}[/\-]\d{2,4}|\d{1,2}-[A-Za-z]{3,9}-\d{2,4}"
+    r"\d{4}-\d{2}-\d{2}|\d{1,2}[/\-]\d{1,2}[/\-]\d{2,4}"
+    r"|\d{1,2}-[A-Za-z]{3,9}-\d{2,4}|\d{1,2}\s+[A-Za-z]{3,9}\s+\d{2,4}"
+)
+
+# A bare amount token like 1,40,000.00 (used for anchor-line detection)
+_AMOUNT_TOKEN_RE = re.compile(r"\d[\d,]*\.\d{2}")
+
+# Page boilerplate that must never merge into a transaction description
+_BOILERPLATE_LINE_RE = re.compile(
+    r"page \d+ of \d+|auto\s*generated|please review|registered office|"
+    r"reg\.?\s*of+i?ce|call us|write to us|follow us|toll.?free",
+    re.IGNORECASE,
 )
 
 # A line that is purely an amount (numeric cell content) — used to detect
@@ -918,13 +974,19 @@ def parse_pdf(file_bytes: bytes, password: str = "", fieldmap_rows: list = None,
     # a matchable header line. Comparing assembled output is layout-agnostic.
     # Best = most rows, then most populated cells (catches dropped columns).
     candidates = []
-    for label, settings in (("lines", None), ("text", {"horizontal_strategy": "text"})):
+    # Tie-break order: "lines" first (pdfplumber's ruled cells group wrapped
+    # description fragments perfectly), then "words" (geometric grouping —
+    # rescues statements whose table lines aren't detectable), then "text".
+    for label, settings in (("lines", None),):
         tables = _extract_tables_from_pdf(file_bytes, settings)
         if tables:
             candidates.append((label, _assemble_from_tables(tables, alias_map, live_col_types)))
     word_tables = _extract_word_column_tables(file_bytes, alias_map)
     if word_tables:
         candidates.append(("words", _assemble_from_tables(word_tables, alias_map, live_col_types)))
+    text_tables = _extract_tables_from_pdf(file_bytes, {"horizontal_strategy": "text"})
+    if text_tables:
+        candidates.append(("text", _assemble_from_tables(text_tables, alias_map, live_col_types)))
 
     def _cand_score(cand):
         cand_rows = cand[1][0]
@@ -1024,7 +1086,7 @@ def parse_pdf(file_bytes: bytes, password: str = "", fieldmap_rows: list = None,
                 r.setdefault(fn, val)
 
     # Reconciliation: count date-like tokens in raw text for debugging
-    _date_tokens = re.findall(r"\b\d{1,2}[-/]\d{1,2}[-/]\d{2,4}\b", text)
+    _date_tokens = _DATE_TOKEN_RE.findall(text)
 
     t4 = time.perf_counter()
     logger.info(
@@ -1061,6 +1123,7 @@ def _parse_rows_fallback(text: str) -> list:
         re.compile(r"^(\d{4}-\d{2}-\d{2})"),
         re.compile(r"^(\d{1,2}[/\-]\d{1,2}[/\-]\d{2,4})(?!\d)"),
         re.compile(r"^(\d{1,2}-[A-Za-z]{3}-\d{2,4})(?!\d)"),
+        re.compile(r"^(\d{1,2}\s+[A-Za-z]{3,9}\s+\d{2,4})(?!\d)"),
     ]
 
     amt_pattern = re.compile(r"(-?[\d,]+\.\d{2})")
