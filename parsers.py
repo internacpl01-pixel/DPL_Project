@@ -269,6 +269,91 @@ def _merge_words_into_phrases(line_words: list, gap: float = 15) -> list:
     return phrases
 
 
+def _body_gutters(body_lines: list, min_width: float = 3.0,
+                  max_cover: float = 0.10) -> list:
+    """Find the vertical whitespace strips that separate the table's columns.
+
+    A header label is usually far narrower than the column beneath it — an
+    11-character "Particulars" sits over a 45-character narration — so the
+    midpoint between two header labels is nowhere near the edge between two
+    columns. The body words are: the x-strips they almost never touch are the
+    real separators. "Almost" matters because a statement's summary and
+    disclaimer lines run the full width; a strip still counts as a gutter when
+    under `max_cover` of the body lines put ink in it.
+
+    Returns [(center_x, width), ...] left to right.
+    """
+    line_spans = []
+    for _, line_words in body_lines:
+        spans = sorted((float(w["x0"]), float(w["x1"])) for w in line_words)
+        if spans:
+            line_spans.append(spans)
+    n = len(line_spans)
+    if n < 4:
+        return []  # too few lines to tell a gutter from a coincidence
+
+    width = int(max(s[-1][1] for s in line_spans)) + 2
+    # Per-line coverage via a difference array — O(words), not O(width) per line.
+    diff = [0] * (width + 2)
+    for spans in line_spans:
+        cur_a, cur_b = spans[0]
+        merged = []
+        for a, b in spans[1:]:
+            if a <= cur_b:
+                cur_b = max(cur_b, b)
+            else:
+                merged.append((cur_a, cur_b))
+                cur_a, cur_b = a, b
+        merged.append((cur_a, cur_b))
+        for a, b in merged:
+            ia, ib = max(0, int(a)), min(width, int(b) + 1)
+            if ib > ia:
+                diff[ia] += 1
+                diff[ib] -= 1
+
+    limit = max_cover * n
+    gutters = []
+    run = 0
+    start = None
+    for x in range(width + 1):
+        run += diff[x]
+        if run <= limit:
+            if start is None:
+                start = x
+        else:
+            if start is not None and x - start >= min_width:
+                gutters.append(((start + x) / 2.0, float(x - start)))
+            start = None
+    return gutters
+
+
+def _snap_boundaries_to_gutters(boundaries: list, cols: list, gutters: list) -> list:
+    """Move each header-derived split into the nearest real column gutter.
+
+    A split only moves to a gutter that lies between the two header labels it
+    separates, and the whole set must stay strictly increasing — otherwise the
+    original midpoints are kept untouched, so a layout we cannot measure
+    behaves exactly as it did before.
+    """
+    if not gutters or not cols or len(cols) != len(boundaries) + 1:
+        return boundaries
+
+    snapped = []
+    for i, seed in enumerate(boundaries):
+        lo, hi = float(cols[i]["x0"]), float(cols[i + 1]["x1"])
+        best = None
+        for center, _w in gutters:
+            if not lo < center < hi:
+                continue
+            if best is None or abs(center - seed) < abs(best - seed):
+                best = center
+        snapped.append(seed if best is None else best)
+
+    if any(b <= a for a, b in zip(snapped, snapped[1:])):
+        return boundaries  # snapping reordered the columns — don't trust it
+    return snapped
+
+
 def _extract_word_column_tables(file_bytes: bytes, alias_map: dict) -> list:
     """
     Build tables from word coordinates — immune to pdfplumber's table-line
@@ -336,7 +421,8 @@ def _extract_word_column_tables(file_bytes: bytes, alias_map: dict) -> list:
                         else:
                             break
                 elif prev_boundaries:
-                    boundaries = prev_boundaries
+                    boundaries = prev_boundaries  # already gutter-corrected
+                    cols = None
                     table = []
                     start_li = 0
                 else:
@@ -357,9 +443,9 @@ def _extract_word_column_tables(file_bytes: bytes, alias_map: dict) -> list:
 
                 # Skip page boilerplate, then group multi-line transactions:
                 # a line carrying a date or amount token is an anchor (its own
-                # row); text-only fragment lines (wrapped descriptions — with
-                # vertically centered cells they sit above AND below the dated
-                # line) attach to the nearest anchor by y-distance.
+                # row); text-only fragment lines are wrapped descriptions, which
+                # sit below the dated line when cells are top-aligned and both
+                # above and below it when they are vertically centred.
                 body = []
                 for y, line_words in lines[start_li:]:
                     joined = " ".join(w["text"] for w in sorted(line_words, key=lambda w: float(w["x0"])))
@@ -371,11 +457,68 @@ def _extract_word_column_tables(file_bytes: bytes, alias_map: dict) -> list:
                                if _DATE_TOKEN_RE.search(" ".join(w["text"] for w in lw))
                                or _AMOUNT_TOKEN_RE.search(" ".join(w["text"] for w in lw))]
 
+                # Column and row geometry are measured over the transaction
+                # block alone. The disclaimer and marketing prose printed under
+                # a statement runs the full page width — left in, it erases
+                # every column gutter and swamps the line-gap statistics.
+                tx_body = (body[anchor_idxs[0]:anchor_idxs[-1] + 1]
+                           if anchor_idxs else body)
+
+                # A header label marks where a column's TITLE sits, not how wide
+                # the column is. Re-seat each split in the whitespace the body
+                # itself leaves between columns, so a wide narration is no longer
+                # cut in half with its tail spilling into the amount column.
+                if cols:
+                    boundaries = _snap_boundaries_to_gutters(
+                        boundaries, cols, _body_gutters(tx_body))
+
                 if anchor_idxs:
                     groups = {a: [] for a in anchor_idxs}
-                    for i, (y, lw) in enumerate(body):
-                        target = i if i in groups else min(anchor_idxs, key=lambda a: abs(body[a][0] - y))
-                        groups[target].append(lw)
+                    anchor_set = set(anchor_idxs)
+
+                    # Which wrapped line belongs to which transaction depends on
+                    # how the statement separates its rows, so measure it. When
+                    # the line gaps split into "inside a row" and "between rows"
+                    # (4.8 vs 15.3 pt on a vertically centred layout), cut at the
+                    # large ones — every line in a block is then its anchor's,
+                    # whether it sits above or below the dated line.
+                    gaps = [tx_body[i][0] - tx_body[i - 1][0]
+                            for i in range(1, len(tx_body))]
+                    cut = None
+                    if len(gaps) >= 3:
+                        med = sorted(gaps)[len(gaps) // 2]
+                        if med > 0 and any(g > med * 1.4 for g in gaps):
+                            cut = med * 1.4
+
+                    blocks = [[0]] if body else []
+                    for i in range(1, len(body)):
+                        if cut is not None and body[i][0] - body[i - 1][0] > cut:
+                            blocks.append([i])
+                        else:
+                            blocks[-1].append(i)
+
+                    last_anchor = None
+                    for blk in blocks:
+                        blk_anchors = [i for i in blk if i in anchor_set]
+                        if len(blk_anchors) == 1:
+                            for i in blk:
+                                groups[blk_anchors[0]].append(body[i][1])
+                            last_anchor = blk_anchors[0]
+                            continue
+                        # Uniform leading (nothing to cut on), or several
+                        # transactions inside one block: the rows are stacked
+                        # top-aligned, so a wrapped line belongs to the anchor it
+                        # follows — never to the one it happens to sit closer to.
+                        for i in blk:
+                            if i in anchor_set:
+                                last_anchor = i
+                                groups[i].append(body[i][1])
+                                continue
+                            target = last_anchor
+                            if target is None:
+                                target = blk_anchors[0] if blk_anchors else None
+                            if target is not None:
+                                groups[target].append(body[i][1])
                     for a in anchor_idxs:
                         table.append(_bucket(groups[a]))
                 else:
