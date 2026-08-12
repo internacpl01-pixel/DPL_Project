@@ -138,44 +138,50 @@ def _build_xlsx(
     # Data rows. Cells are typed from the live column type so Excel gets real
     # dates and integers instead of text — sorting, date filters and number
     # formatting all depend on the cell type, not just how the value looks.
+    # Widths are measured from the RENDERED text, not the raw value: "#,##0.00"
+    # turns 4000000.0 into "4,000,000.00" — three characters wider than str()
+    # reports — and a column sized from str() renders the cell as "#####".
+    widths = [len(str(lbl)) for lbl in col_display]
+
     for ri, row in enumerate(rows, 2):
         for ci, c in enumerate(col_names, 1):
             val = row.get(c, "")
             ctype = col_types.get(c, "")
             cell = ws.cell(row=ri, column=ci)
+            shown = ""
             if val is None or val == "":
                 cell.value = None
             elif _is_date(ctype):
                 parsed = _as_date(val)
                 if parsed is None:
-                    cell.value = str(val)
+                    cell.value = shown = str(val)
                 else:
                     cell.value = parsed
                     cell.number_format = "yyyy-mm-dd"
+                    shown = "0000-00-00"
             elif _is_integer(ctype):
                 s = str(val).replace(",", "").strip()
                 try:
                     cell.value = int(s) if s.lstrip("-").isdigit() else int(float(s))
                     cell.number_format = "0"
+                    shown = str(cell.value)
                 except (ValueError, TypeError):
-                    cell.value = str(val)
+                    cell.value = shown = str(val)
             elif _is_numeric(ctype):
                 try:
                     cell.value = float(str(val).replace(",", ""))
                     cell.number_format = "#,##0.00"
+                    shown = f"{cell.value:,.2f}"
                 except (ValueError, TypeError):
-                    cell.value = str(val)
+                    cell.value = shown = str(val)
             else:
-                cell.value = str(val)
+                cell.value = shown = str(val)
+            widths[ci - 1] = max(widths[ci - 1], len(shown))
 
-    # auto-fit column widths (cap at 50 chars)
+    # Pad by 2 for cell margins; cap at 50 so one long narration can't stretch
+    # the sheet off-screen.
     for ci in range(1, len(col_names) + 1):
-        max_len = len(col_display[ci - 1])
-        for ri in range(2, min(len(rows) + 2, 200)):
-            v = ws.cell(row=ri, column=ci).value
-            if v is not None:
-                max_len = max(max_len, min(len(str(v)), 50))
-        ws.column_dimensions[get_column_letter(ci)].width = min(max_len + 2, 50)
+        ws.column_dimensions[get_column_letter(ci)].width = min(widths[ci - 1] + 2, 50)
 
     buf = io.BytesIO()
     wb.save(buf)
