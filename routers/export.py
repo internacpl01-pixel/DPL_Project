@@ -4,7 +4,7 @@ from __future__ import annotations
 import csv
 import io
 import logging
-from datetime import date
+from datetime import date, datetime
 from typing import Optional
 
 from fastapi import APIRouter, Depends, Query, HTTPException
@@ -20,12 +20,37 @@ logger = logging.getLogger(__name__)
 router = APIRouter(prefix="/api", tags=["export"])
 
 _NUMERIC_TYPES = {"numeric", "real", "double precision", "integer", "bigint"}
+_INTEGER_TYPES = {"integer", "bigint", "smallint"}
+_DATE_TYPES = {"date", "timestamp", "timestamp without time zone",
+               "timestamp with time zone"}
 
 
 # ── helpers ──────────────────────────────────────────────────────────
 
 def _is_numeric(col_type: str) -> bool:
     return (col_type or "").lower() in _NUMERIC_TYPES
+
+
+def _is_integer(col_type: str) -> bool:
+    """Whole-number column — money formatting would render an id as "41.00"."""
+    return (col_type or "").lower() in _INTEGER_TYPES
+
+
+def _is_date(col_type: str) -> bool:
+    return (col_type or "").lower() in _DATE_TYPES
+
+
+def _as_date(val):
+    """Coerce a cell value to date/datetime for Excel, or None if it isn't one."""
+    if isinstance(val, (datetime, date)):
+        return val
+    s = str(val).strip()
+    for parse in (date.fromisoformat, datetime.fromisoformat):
+        try:
+            return parse(s)
+        except (ValueError, TypeError):
+            continue
+    return None
 
 
 async def _fetch_all(search: str = "") -> tuple[list[dict], list[dict]]:
@@ -110,14 +135,31 @@ def _build_xlsx(
         cell.font = cell.font.copy(bold=True)
         cell.fill = _HDR_FILL
 
-    # data rows
+    # Data rows. Cells are typed from the live column type so Excel gets real
+    # dates and integers instead of text — sorting, date filters and number
+    # formatting all depend on the cell type, not just how the value looks.
     for ri, row in enumerate(rows, 2):
         for ci, c in enumerate(col_names, 1):
             val = row.get(c, "")
+            ctype = col_types.get(c, "")
             cell = ws.cell(row=ri, column=ci)
             if val is None or val == "":
                 cell.value = None
-            elif _is_numeric(col_types.get(c, "")):
+            elif _is_date(ctype):
+                parsed = _as_date(val)
+                if parsed is None:
+                    cell.value = str(val)
+                else:
+                    cell.value = parsed
+                    cell.number_format = "yyyy-mm-dd"
+            elif _is_integer(ctype):
+                s = str(val).replace(",", "").strip()
+                try:
+                    cell.value = int(s) if s.lstrip("-").isdigit() else int(float(s))
+                    cell.number_format = "0"
+                except (ValueError, TypeError):
+                    cell.value = str(val)
+            elif _is_numeric(ctype):
                 try:
                     cell.value = float(str(val).replace(",", ""))
                     cell.number_format = "#,##0.00"
