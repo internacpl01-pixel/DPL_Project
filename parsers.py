@@ -454,6 +454,37 @@ def _fieldname_category(fieldname: str) -> str | None:
     return None  # custom field — passthrough
 
 
+# Banks print long reference numbers inside a narrow narration column, so their
+# own layout wraps them mid-token. Table extraction returns those as separate
+# lines, which get rejoined with a space — leaving "AUBLN6202605084170099 8".
+# Each pattern below targets a shape that cannot legitimately contain a space,
+# so anything the bank really did print with a space is left alone.
+_WRAP_REF_TAIL_RE = re.compile(r"\b([A-Z]{2,6}\d{10,})[ \t]+(\d{1,3})(?!\d)")
+_WRAP_REF_HEAD_RE = re.compile(r"(?<! )-[ \t]+(?=[A-Z]{2,6}\d{10,})")
+_WRAP_IDENT_RE = re.compile(r"\b([A-Z0-9]*_[A-Z0-9_]*)[ \t]+([A-Z0-9]+_[A-Z0-9_]*)")
+
+
+def _repair_wrapped_tokens(text: str) -> str:
+    """Undo spaces that a mid-token line wrap injected into a narration.
+
+    Three shapes are rejoined:
+      • a reference split before its last digits   "AUBLN...0099 8"  -> "...00998"
+      • a DR-/CR- prefix split from its reference  "NEFT DR- AUBLN"  -> "DR-AUBLN"
+      • an underscore identifier split in two      "..._AP R26_JUN26" -> "..._APR26_JUN26"
+
+    Everything else is returned untouched, so a narration that never wrapped is
+    passed through byte-for-byte.
+    """
+    if not text or " " not in text:
+        return text
+    prev = None
+    while prev != text:  # one token can be wrapped more than once
+        prev = text
+        text = _WRAP_REF_TAIL_RE.sub(r"\1\2", text)
+    text = _WRAP_REF_HEAD_RE.sub("-", text)
+    return _WRAP_IDENT_RE.sub(r"\1\2", text)
+
+
 def _has_valid_date(row_cells: list, date_col_idx: int) -> bool:
     """Check if a row has a valid date in the date column."""
     if date_col_idx is None or date_col_idx >= len(row_cells):
@@ -1079,6 +1110,19 @@ def parse_pdf(file_bytes: bytes, password: str = "", fieldmap_rows: list = None,
                 new_row[key] = re.sub(r"\s+", " ", str(val)).strip()
         if new_row:
             normalized.append(new_row)
+
+    # Rejoin tokens the bank's own line wrapping split apart in the narration.
+    # Runs after normalization so the existing type-coercion path is untouched;
+    # the target column is resolved by category, never by a hardcoded name.
+    desc_fields = {
+        (fm.get("fieldname") or "")
+        for fm in (fieldmap_rows or [])
+        if _fieldname_category(fm.get("fieldname") or "") == "description"
+    }
+    for r in normalized:
+        for fn in desc_fields:
+            if isinstance(r.get(fn), str):
+                r[fn] = _repair_wrapped_tokens(r[fn])
 
     # Document-level fields: custom fields with no table column (e.g. an
     # account number printed above the table) get their value from raw text
