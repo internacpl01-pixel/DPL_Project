@@ -13,6 +13,12 @@ _TOTAL_COUNT_CACHE = {"total": None, "expires_at": 0}
 _TOTAL_COUNT_TTL = 15
 
 
+def _q(col: str) -> str:
+    """Quote a master column for interpolation. `desc` is a reserved word;
+    the rest are plain lowercase identifiers."""
+    return f'"{col}"' if col == "desc" else col
+
+
 def _invalidate_live_cols_cache():
     _LIVE_COLS_CACHE["cols"] = None
     _LIVE_COLS_CACHE["expires_at"] = 0
@@ -57,9 +63,8 @@ async def get_live_columns() -> list:
     return cols
 
 
-async def get_master_rows(limit: int = 50, offset: int = 0) -> dict:
+async def get_master_rows(limit: int = 50, offset: int = 0, search: str = "") -> dict:
     t0 = _time.time()
-    total = await _get_total_count()
 
     live_cols = await get_live_columns()
     col_names = [c["name"] for c in live_cols]
@@ -69,11 +74,35 @@ async def get_master_rows(limit: int = 50, offset: int = 0) -> dict:
     fieldmap_rows = await get_field_mappings()
     display_map = {r["fieldname"]: r.get("displayname", r["fieldname"]) for r in fieldmap_rows}
 
-    cols_str = ", ".join(f'"{c}"' if c == "desc" else c for c in col_names)
+    cols_str = ", ".join(_q(c) for c in col_names)
+
+    # The search runs here, in SQL — not in the browser. The client only ever
+    # holds one page, so filtering there can never see a match on any other
+    # page. The count has to come from the same WHERE clause too, otherwise
+    # the pagination bar advertises pages that hold no matches.
+    search = (search or "").strip()
+    params = []
+    where_sql = ""
+    if search:
+        # strpos, not ILIKE: the term is raw user input, and % / _ would be
+        # read as wildcards. concat_ws over every live column keeps the old
+        # client-side rule (join all values, case-insensitive substring), and
+        # its implicit cast means DATE and NUMERIC match the way they display.
+        cat = "concat_ws(' ', " + ", ".join(_q(c) for c in col_names) + ")"
+        where_sql = f" WHERE strpos(lower({cat}), lower($1)) > 0"
+        params.append(search)
+
+    if search:
+        # Not cached — the cache holds the unfiltered count, and a per-term
+        # cache would only pay off if the same term were searched twice.
+        total = await Database.fetchval(f"SELECT COUNT(*) FROM master{where_sql}", *params)
+    else:
+        total = await _get_total_count()
 
     rows = await Database.fetch(
-        f"SELECT {cols_str} FROM master ORDER BY id DESC LIMIT $1 OFFSET $2",
-        limit, offset,
+        f"SELECT {cols_str} FROM master{where_sql} "
+        f"ORDER BY id DESC LIMIT ${len(params) + 1} OFFSET ${len(params) + 2}",
+        *params, limit, offset,
     )
     result_rows = []
     for record in rows:
@@ -82,7 +111,7 @@ async def get_master_rows(limit: int = 50, offset: int = 0) -> dict:
     ms = (_time.time() - t0) * 1000
     logger.info(
         f"get_master_rows: page={(offset // limit) + 1}, limit={limit}, "
-        f"rows={len(result_rows)}, total={total}, time={ms:.0f}ms"
+        f"rows={len(result_rows)}, total={total}, search={search!r}, time={ms:.0f}ms"
     )
     return {
         "rows": result_rows,

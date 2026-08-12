@@ -10,11 +10,12 @@ router = APIRouter(prefix="/api", tags=["data"])
 
 
 @router.get("/data")
-async def list_data(page: int = 1, limit: int = 50, current_user: dict = Depends(get_current_user)):
+async def list_data(page: int = 1, limit: int = 50, search: str = "",
+                    current_user: dict = Depends(get_current_user)):
     page = max(1, page)
     limit = max(1, min(500, limit))
     offset = (page - 1) * limit
-    return await get_master_rows(limit=limit, offset=offset)
+    return await get_master_rows(limit=limit, offset=offset, search=search)
 
 
 @router.post("/data")
