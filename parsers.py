@@ -983,26 +983,41 @@ def _extract_document_level_fields(text: str, fieldmap_rows: list, filled_fields
 
         aliases = set()
         for src in (row.get("mapfields", "") or "").split(","):
-            norm = _normalize_for_matching(src)
-            if norm:
-                aliases.add(norm)
+            src = src.strip()
+            if src:
+                aliases.add(src)
         for src in (row.get("displayname", ""), fieldname):
-            norm = _normalize_for_matching(src or "")
-            if norm:
-                aliases.add(norm)
+            src = (src or "").strip()
+            if src:
+                aliases.add(src)
 
         for alias in sorted(aliases, key=len, reverse=True):
-            if len(alias) < 4:
+            if len(alias) < 3:
                 continue  # too short — would match random text
-            words = [re.escape(w) for w in alias.split()]
-            words[-1] = words[-1] + r"[a-z]*"
-            pattern = r"\b" + r"[\s._\-]*".join(words) + r"[\s:\-–=]*([A-Za-z0-9][A-Za-z0-9/\-]*)"
-            m = re.search(pattern, text, re.IGNORECASE)
-            if m:
+            # The pattern is built from the alias AS WRITTEN and matched against
+            # the raw page text, so the two must agree on punctuation. Splitting
+            # into alphanumeric runs and rejoining with a flexible separator
+            # lets one alias match every way a bank prints the label:
+            # "A/c" also matches "A/C", "Ac", "A-c"; "num" also matches "number".
+            parts = [re.escape(p) for p in re.findall(r"[A-Za-z]+|\d+", alias)]
+            if not parts:
+                continue
+            parts[-1] += r"[a-z]*"
+            # The value must sit on the SAME line as its label. Allowing a
+            # newline here lets a table's column heading swallow the first cell
+            # of the row beneath it — re-importing our own export matched the
+            # "account_num" heading and captured the next row's date.
+            pattern = (r"\b" + r"[\s._/\-]*".join(parts)
+                       + r"[ \t:\-–=#]*([A-Za-z0-9][A-Za-z0-9/\-]*)")
+            # Keep scanning past a label that is followed by another label
+            # rather than a value ("Account Number Account Type Currency").
+            for m in re.finditer(pattern, text, re.IGNORECASE):
                 val = m.group(1).strip()
                 if len(val) >= 4 and any(ch.isdigit() for ch in val):
                     doc_fields[fieldname] = val
                     break
+            if fieldname in doc_fields:
+                break
 
     return doc_fields
 
