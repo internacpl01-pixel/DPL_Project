@@ -173,53 +173,96 @@ def _build_pdf(
 ) -> tuple[bytes, str, str]:
     pdf = _ExportPDF(orientation="L", unit="mm", format="A4")
     pdf.row_count = len(rows)
-    pdf.set_auto_page_break(auto=True, margin=10)
+    # Page breaks are handled manually so every page can repeat the header row;
+    # leaving fpdf's automatic break on as well would split a row across pages
+    # and re-enter header() mid-row with a different font size.
+    pdf.set_auto_page_break(auto=False, margin=12)
 
     usable_w = pdf.w - pdf.l_margin - pdf.r_margin  # landscape A4 ≈ 277 mm
     n = len(col_names)
 
-    # Fixed column widths (mm) — tuned for 7-column bank statement layout
-    _WIDTHS = {
-        "id":          12,
-        "date":        22,
-        "desc":       140,
-        "withdrawal":  25,
-        "deposits":    25,
-        "balance":     25,
-        "account_num": 30,
-    }
-    # Fallback width for unknown columns
-    def _col_w(name: str) -> float:
-        return _WIDTHS.get(name, usable_w / max(n, 1))
+    # Widths come from the actual content, never from a name-keyed table — the
+    # field map is dynamic, so any hardcoded lookup silently degrades to an even
+    # split for renamed or custom fields. Weight each column by its widest
+    # sampled cell, clamp so one long narration can't starve the rest, then
+    # normalize so the table ends exactly on the right margin.
+    sample = rows[:200]
+    weights: list[float] = []
+    for i, c in enumerate(col_names):
+        longest = len(str(col_display[i]))
+        for r in sample:
+            v = r.get(c)
+            if v is not None:
+                longest = max(longest, len(str(v)))
+        weights.append(float(min(max(longest, 6), 70)))
 
-    col_w = [_col_w(c) for c in col_names]
-    row_h = 5.5
-    total_w = sum(col_w)
+    total_wt = sum(weights) or 1.0
+    col_w = [max(usable_w * (w / total_wt), 8.0) for w in weights]
+    scale = usable_w / sum(col_w)  # the 8 mm floor can push the sum over
+    col_w = [w * scale for w in col_w]
 
-    def _cell(text: str, w: float, bold: bool = False, align: str = "L") -> None:
-        if bold:
-            pdf.set_font("Helvetica", "B", 7)
-        else:
-            pdf.set_font("Helvetica", "", 7)
-        pdf.cell(w, row_h, text if len(text) < 80 else text[:77] + "...",
-                 border=1, align=align)
+    row_h = 5.5    # header row / minimum data row height
+    line_h = 3.2   # one wrapped line of body text
+    pad = 0.5      # horizontal breathing room inside each cell
+
+    def _fit(text: str, w: float) -> str:
+        """Trim *text* to what fits on one line of *w* mm at the current font."""
+        avail = w - 2 * pad
+        if avail <= 0:
+            return ""
+        if pdf.get_string_width(text) <= avail:
+            return text
+        lo, hi = 0, len(text)
+        while lo < hi:
+            mid = (lo + hi + 1) // 2
+            if pdf.get_string_width(text[:mid] + "...") <= avail:
+                lo = mid
+            else:
+                hi = mid - 1
+        return text[:lo] + "..." if lo else ""
+
+    def _wrap(text: str, w: float) -> list[str]:
+        """Split *text* into the lines fpdf will lay out in a *w* mm cell."""
+        if not text:
+            return [""]
+        # WORD wrapping keeps the text reconstructable from the PDF text layer;
+        # fpdf still hard-splits any single token too long for the column.
+        return list(pdf.multi_cell(w - 2 * pad, line_h, text, dry_run=True,
+                                   output="LINES")) or [""]
 
     def _header_row() -> None:
+        # Must set its own font: header() leaves it at 13/9 pt, which clipped
+        # the labels on the first page only.
+        pdf.set_font("Helvetica", "B", 7)
         pdf.set_fill_color(230, 230, 230)
         for label, w in zip(col_display, col_w):
-            pdf.cell(w, row_h, label, border=1, align="L", fill=True)
+            pdf.cell(w, row_h, _fit(str(label), w), border=1, align="L", fill=True)
         pdf.ln(row_h)
 
-    def _data_row(row: dict) -> None:
+    def _draw_row(row: dict) -> None:
+        """Render one transaction, wrapping long text instead of dropping it."""
+        pdf.set_font("Helvetica", "", 7)
+        cells = []
         for c, w in zip(col_names, col_w):
             val = row.get(c, "")
-            if val is None:
-                val = ""
-            val = str(val)
-            if _is_numeric(col_types.get(c, "")):
-                _cell(val, w, align="R")
-            else:
-                _cell(val, w)
+            val = "" if val is None else str(val)
+            cells.append(_wrap(val, w))
+
+        h = max(row_h, max(len(ls) for ls in cells) * line_h + 1.4)
+
+        if pdf.get_y() + h > pdf.h - pdf.b_margin:
+            pdf.add_page()
+            _header_row()
+            pdf.set_font("Helvetica", "", 7)
+
+        x, y = pdf.l_margin, pdf.get_y()
+        for c, w, lines in zip(col_names, col_w, cells):
+            pdf.rect(x, y, w, h)
+            pdf.set_xy(x + pad, y + 0.7)
+            pdf.multi_cell(w - 2 * pad, line_h, "\n".join(lines),
+                           border=0, align="R" if _is_numeric(col_types.get(c, "")) else "L")
+            x += w
+        pdf.set_xy(pdf.l_margin, y + h)
 
     if n == 0 or not rows:
         pdf.add_page()
@@ -229,11 +272,7 @@ def _build_pdf(
         pdf.add_page()
         _header_row()
         for row in rows:
-            if pdf.get_y() + row_h > pdf.h - pdf.b_margin:
-                pdf.add_page()
-                _header_row()
-            _data_row(row)
-            pdf.ln(row_h)
+            _draw_row(row)
 
     buf = io.BytesIO()
     pdf.output(buf)

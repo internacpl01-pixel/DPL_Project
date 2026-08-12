@@ -745,6 +745,14 @@ def _assemble_rows(table_rows: list, header_idx: int, col_mapping: dict,
                 fieldname = col_mapping.get(col_idx)
                 if not fieldname or not cell:
                     continue
+                # Statements commonly carry both a transaction date and a value
+                # date, and both map to the same field. date_cols is ordered
+                # left-to-right, so the first one seen is the transaction date —
+                # keep it instead of letting the value date overwrite it. The
+                # two only differ on month-boundary postings (interest, EOD
+                # sweeps), which is exactly where the wrong one misfiles a row.
+                if col_idx in date_cols and current_row.get(fieldname):
+                    continue
                 current_row[fieldname] = cell
             if inherit_date and date_fieldname and last_date_val and not current_row.get(date_fieldname):
                 current_row[date_fieldname] = last_date_val
