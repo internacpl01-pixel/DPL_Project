@@ -143,17 +143,27 @@ def _build_xlsx(
 # ── PDF ──────────────────────────────────────────────────────────────
 
 class _ExportPDF(FPDF):
-    """Minimal PDF with a header, data table, and footer."""
+    """Table-based PDF export — fixed row heights, no wrapping chaos."""
+
+    def __init__(self, *args, **kwargs):
+        super().__init__(*args, **kwargs)
+        self._title_rows = 0
 
     def header(self) -> None:
-        self.set_font("Helvetica", "B", 14)
-        self.cell(0, 8, "Master Data Export", new_x="LMARGIN", new_y="NEXT")
+        if self.page_no() == 1:
+            self._title_rows = 0  # first page uses regular header
+        self.set_font("Helvetica", "B", 13)
+        self.cell(0, 7, "Master Data Export", new_x="LMARGIN", new_y="NEXT")
         self.set_font("Helvetica", "", 9)
-        self.cell(0, 5, f"Generated: {date.today().isoformat()}     Rows: {self.row_count}", new_x="LMARGIN", new_y="NEXT")
-        self.ln(2)
+        self.cell(0, 5,
+            f"Generated: {date.today().isoformat()}     "
+            f"Rows: {self.row_count}",
+            new_x="LMARGIN", new_y="NEXT")
+        self.ln(1)
+        self._title_rows += 2 if self.page_no() == 1 else 1
 
     def footer(self) -> None:
-        self.set_y(-12)
+        self.set_y(-10)
         self.set_font("Helvetica", "I", 8)
         self.cell(0, 10, f"Page {self.page_no()}", align="C")
 
@@ -163,68 +173,67 @@ def _build_pdf(
 ) -> tuple[bytes, str, str]:
     pdf = _ExportPDF(orientation="L", unit="mm", format="A4")
     pdf.row_count = len(rows)
-    pdf.set_auto_page_break(auto=True, margin=12)
+    pdf.set_auto_page_break(auto=True, margin=10)
 
     usable_w = pdf.w - pdf.l_margin - pdf.r_margin  # landscape A4 ≈ 277 mm
     n = len(col_names)
 
-    if n == 0:
+    # Fixed column widths (mm) — tuned for 7-column bank statement layout
+    _WIDTHS = {
+        "id":          12,
+        "date":        22,
+        "desc":       140,
+        "withdrawal":  25,
+        "deposits":    25,
+        "balance":     25,
+        "account_num": 30,
+    }
+    # Fallback width for unknown columns
+    def _col_w(name: str) -> float:
+        return _WIDTHS.get(name, usable_w / max(n, 1))
+
+    col_w = [_col_w(c) for c in col_names]
+    row_h = 5.5
+    total_w = sum(col_w)
+
+    def _cell(text: str, w: float, bold: bool = False, align: str = "L") -> None:
+        if bold:
+            pdf.set_font("Helvetica", "B", 7)
+        else:
+            pdf.set_font("Helvetica", "", 7)
+        pdf.cell(w, row_h, text if len(text) < 80 else text[:77] + "...",
+                 border=1, align=align)
+
+    def _header_row() -> None:
+        pdf.set_fill_color(230, 230, 230)
+        for label, w in zip(col_display, col_w):
+            pdf.cell(w, row_h, label, border=1, align="L", fill=True)
+        pdf.ln(row_h)
+
+    def _data_row(row: dict) -> None:
+        for c, w in zip(col_names, col_w):
+            val = row.get(c, "")
+            if val is None:
+                val = ""
+            val = str(val)
+            if _is_numeric(col_types.get(c, "")):
+                _cell(val, w, align="R")
+            else:
+                _cell(val, w)
+
+    if n == 0 or not rows:
         pdf.add_page()
         pdf.set_font("Helvetica", "", 10)
         pdf.cell(0, 8, "No data to export.", new_x="LMARGIN", new_y="NEXT")
     else:
-        # Proportional column widths; minimum 18 mm per column
-        min_col = 18
-        max_col = usable_w / n
-        col_w = min(max_col, max(min_col, usable_w / max(n, 1)))
-
-        # If columns don't fit on one line, wrap to multi-row header
-        header_rows = []
-        current_row: list[str] = []
-        current_w: list[float] = []
-        used = 0.0
-        for i in range(n):
-            if current_row and used + col_w > usable_w:
-                header_rows.append((current_row[:], current_w[:]))
-                current_row.clear()
-                current_w.clear()
-                used = 0.0
-            current_row.append(str(col_display[i]))
-            current_w.append(col_w)
-            used += col_w
-        if current_row:
-            header_rows.append((current_row, current_w))
-
-        def _draw_row(cells: list[str], widths: list[float], is_header: bool = False) -> None:
-            row_h = 5.5 if is_header else 5
-            start_x = pdf.get_x()
-            start_y = pdf.get_y()
-            max_h = row_h
-
-            for text, w in zip(cells, widths):
-                pdf.rect(start_x, start_y, w, max_h, style="D" if is_header else "")
-                pdf.set_xy(start_x, start_y + 0.4)
-                pdf.set_font("Helvetica", "B" if is_header else "", 8)
-                pdf.multi_cell(w, 3.2, text, align="L")
-                start_x += w
-            pdf.set_xy(pdf.l_margin, start_y + max_h)
-
         pdf.add_page()
-        for h_cells, h_widths in header_rows:
-            _draw_row(h_cells, h_widths, is_header=True)
-
+        _header_row()
         for row in rows:
-            cells = []
-            widths = []
-            for c in col_names:
-                val = row.get(c, "")
-                if val is None:
-                    val = ""
-                else:
-                    val = str(val)
-                cells.append(val)
-                widths.append(col_w)
-            _draw_row(cells, widths, is_header=False)
+            if pdf.get_y() + row_h > pdf.h - pdf.b_margin:
+                pdf.add_page()
+                _header_row()
+            _data_row(row)
+            pdf.ln(row_h)
 
     buf = io.BytesIO()
     pdf.output(buf)

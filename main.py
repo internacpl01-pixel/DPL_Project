@@ -34,13 +34,15 @@ app = FastAPI(title="DPL Data Bank API", lifespan=lifespan)
 app.add_middleware(
     CORSMiddleware,
     allow_origins=["https://dpl-f.vercel.app", "https://dpl-project.onrender.com"],
-    # Vercel preview deployments get a random-hash subdomain per branch/PR
-    # (e.g. dpl-iyf6mt7dt-dpl-project-xxx.vercel.app) — those can't be
-    # listed individually, so match any *.vercel.app URL for this project.
-    allow_origin_regex=r"^https://dpl(-[a-zA-Z0-9]+)*\.vercel\.app$",
+    # Match both production (dpl-f.vercel.app) and any Vercel preview
+    # subdomain for this project (dpl-{hash}-dpl-project-{hash}.vercel.app).
+    allow_origin_regex=r"^https://([a-zA-Z0-9-]+\.)*vercel\.app$",
     allow_credentials=True,
     allow_methods=["*"],
     allow_headers=["*"],
+    # CORS hides all but a few safelisted response headers from JS. The export
+    # download reads Content-Disposition to get the server-side filename.
+    expose_headers=["Content-Disposition"],
 )
 
 FRONTEND_DIR = Path(__file__).resolve().parent.parent / "frontend"
