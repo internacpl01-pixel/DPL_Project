@@ -11,7 +11,7 @@ from fastapi.staticfiles import StaticFiles
 from database import Database
 from services.schema_init import create_tables, insert_default_mappings, create_default_admin
 
-from routers import auth, users, mappings, data, imports
+from routers import auth, users, mappings, data, imports, export
 
 logger = logging.getLogger(__name__)
 
@@ -53,6 +53,7 @@ app.include_router(users.router)
 app.include_router(mappings.router)
 app.include_router(data.router)
 app.include_router(imports.router)
+app.include_router(export.router)
 
 
 @app.get("/", include_in_schema=False)
