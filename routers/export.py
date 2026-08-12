@@ -57,7 +57,10 @@ async def _fetch_all(search: str = "") -> tuple[list[dict], list[dict]]:
     """Return (columns, rows) with the full master table.
 
     Columns come from the first page; rows are paginated in 500-row chunks.
-    Client-side search filtering is applied when *search* is non-empty.
+    *search* is handed to the query rather than applied here, so an export
+    holds exactly the rows the table shows. Filtering in this loop also cut it
+    short: a filtered chunk is almost always smaller than the page size, so
+    the `len(batch) < limit` check below stopped after the first 500 rows.
     """
     limit = 500
     offset = 0
@@ -65,18 +68,10 @@ async def _fetch_all(search: str = "") -> tuple[list[dict], list[dict]]:
     columns: list[dict] = []
 
     while True:
-        result = await get_master_rows(limit=limit, offset=offset)
+        result = await get_master_rows(limit=limit, offset=offset, search=search)
         if not columns and result.get("columns"):
             columns = result["columns"]
         batch = result.get("rows", [])
-
-        if search:
-            term = search.lower()
-            batch = [
-                r for r in batch
-                if any(str(v).lower().find(term) != -1 for v in r.values() if v is not None)
-            ]
-
         all_rows.extend(batch)
         if len(batch) < limit:
             break

@@ -80,17 +80,23 @@ async def get_master_rows(limit: int = 50, offset: int = 0, search: str = "") ->
     # holds one page, so filtering there can never see a match on any other
     # page. The count has to come from the same WHERE clause too, otherwise
     # the pagination bar advertises pages that hold no matches.
+    #
+    # It matches the id column and nothing else. A match-anything search reads
+    # every column, so "345" also hits a narration ending 608610587345 and a
+    # balance of 73450.01 — correct, but useless when you are looking up a row
+    # by its id.
     search = (search or "").strip()
     params = []
     where_sql = ""
     if search:
-        # strpos, not ILIKE: the term is raw user input, and % / _ would be
-        # read as wildcards. concat_ws over every live column keeps the old
-        # client-side rule (join all values, case-insensitive substring), and
-        # its implicit cast means DATE and NUMERIC match the way they display.
-        cat = "concat_ws(' ', " + ", ".join(_q(c) for c in col_names) + ")"
-        where_sql = f" WHERE strpos(lower({cat}), lower($1)) > 0"
-        params.append(search)
+        # id is a 32-bit SERIAL, so cap the digits before casting: a longer
+        # run of digits would overflow int4 and error out instead of simply
+        # not matching. Anything non-numeric can never be an id.
+        if search.isdigit() and len(search) <= 9:
+            where_sql = " WHERE id = $1"
+            params.append(int(search))
+        else:
+            where_sql = " WHERE false"
 
     if search:
         # Not cached — the cache holds the unfiltered count, and a per-term
