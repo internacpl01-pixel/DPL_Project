@@ -1,4 +1,6 @@
 """Field mappings router — list, update, delete mapfield, custom fields, table structure, change log."""
+import re
+
 from fastapi import APIRouter, Depends, HTTPException, Request, status
 
 from dependencies import get_current_user, require_level
@@ -8,11 +10,21 @@ from services.mappings import (
     get_table_structure,
     get_change_log,
     update_field_mapping,
+    log_field_change,
     _invalidate_field_mappings_cache,
 )
 from database import Database
 
 router = APIRouter(prefix="/api", tags=["mappings"])
+
+# Dropping one of these would break import, export and the balance chain, so
+# the API refuses regardless of what the caller sends.
+_PROTECTED_COLUMNS = frozenset({"id", "date", "desc", "withdrawal", "deposits", "balance"})
+
+# A column name cannot be a bind parameter, so DROP COLUMN has to interpolate
+# it. This is what makes that safe — nothing but a plain lowercase identifier
+# ever reaches the SQL string.
+_SAFE_COLUMN = re.compile(r"^[a-z_][a-z0-9_]{0,62}$")
 
 
 @router.get("/field-mappings")
@@ -173,3 +185,59 @@ async def create_custom_field(body: CustomFieldRequest, current_user: dict = Dep
         )
 
     return {"column": col_name, "type": sql_type}
+
+
+@router.delete("/custom-fields/{fieldname}")
+async def delete_custom_field(fieldname: str, current_user: dict = Depends(require_level(1, 2))):
+    """Delete a custom field: drop the master column AND its fieldmap row.
+
+    The two drift apart in practice — a column dropped straight from Postgres
+    leaves its fieldmap row orphaned — so each side is removed independently
+    and a field missing either one still deletes cleanly.
+    """
+    # No case folding. Column names here are always lowercase, so folding buys
+    # nothing — but it lets "Field_Num_1" resolve to a real field the caller
+    # never named, which is the wrong way for a DROP COLUMN to be forgiving.
+    # _SAFE_COLUMN rejects anything with an uppercase letter outright.
+    name = (fieldname or "").strip()
+    if not _SAFE_COLUMN.match(name):
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail=f"Invalid field name: '{fieldname}'",
+        )
+    if name in _PROTECTED_COLUMNS:
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail=f"'{name}' is a core statement column and cannot be deleted",
+        )
+
+    async with Database.acquire() as conn:
+        async with conn.transaction():
+            record = await conn.fetchrow("SELECT id FROM fieldmap WHERE fieldname=$1", name)
+            has_column = await conn.fetchval(
+                "SELECT 1 FROM information_schema.columns "
+                "WHERE table_name='master' AND column_name=$1",
+                name,
+            )
+            if not record and not has_column:
+                raise HTTPException(
+                    status_code=status.HTTP_404_NOT_FOUND,
+                    detail=f"No field named '{name}'",
+                )
+            if has_column:
+                await conn.execute(f'ALTER TABLE master DROP COLUMN "{name}"')
+            if record:
+                await conn.execute("DELETE FROM fieldmap WHERE fieldname=$1", name)
+
+    from services.data import _invalidate_live_cols_cache
+    _invalidate_live_cols_cache()
+    _invalidate_field_mappings_cache()
+    if record:
+        await log_field_change(name, record["id"], "fieldmap")
+
+    return {
+        "fieldname": name,
+        "column_dropped": bool(has_column),
+        "mapping_removed": bool(record),
+        "message": f"Field '{name}' deleted",
+    }
