@@ -9,7 +9,7 @@ from fastapi.responses import FileResponse
 from fastapi.staticfiles import StaticFiles
 
 from database import Database
-from services.schema_init import create_tables, insert_default_mappings, create_default_admin
+from services.schema_init import create_tables, create_default_admin
 
 from routers import auth, users, mappings, data, imports, export
 
@@ -20,7 +20,6 @@ logger = logging.getLogger(__name__)
 async def lifespan(app: FastAPI):
     await Database.connect()
     await create_tables()
-    await insert_default_mappings()
     try:
         await create_default_admin()
     except Exception:

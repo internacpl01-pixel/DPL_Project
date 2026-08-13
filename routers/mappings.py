@@ -17,9 +17,11 @@ from database import Database
 
 router = APIRouter(prefix="/api", tags=["mappings"])
 
-# Dropping one of these would break import, export and the balance chain, so
-# the API refuses regardless of what the caller sends.
-_PROTECTED_COLUMNS = frozenset({"id", "date", "desc", "withdrawal", "deposits", "balance"})
+# Every field on master is a custom field and every one of them is deletable.
+# id is the sole exception: it is master's primary key, not a fieldmap field —
+# it carries no statement data, is never listed in the UI, and dropping it
+# would break row delete, `ORDER BY id` pagination and the ID search.
+_PROTECTED_COLUMNS = frozenset({"id"})
 
 # A column name cannot be a bind parameter, so DROP COLUMN has to interpolate
 # it. This is what makes that safe — nothing but a plain lowercase identifier
@@ -208,7 +210,7 @@ async def delete_custom_field(fieldname: str, current_user: dict = Depends(requi
     if name in _PROTECTED_COLUMNS:
         raise HTTPException(
             status_code=status.HTTP_400_BAD_REQUEST,
-            detail=f"'{name}' is a core statement column and cannot be deleted",
+            detail=f"'{name}' is master's primary key and cannot be deleted",
         )
 
     async with Database.acquire() as conn:

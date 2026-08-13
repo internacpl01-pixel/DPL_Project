@@ -36,14 +36,10 @@ async def create_tables():
                 created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
             )
         """)
-        for col, sql_type in [("date", "DATE"), ("desc", "TEXT"), ("withdrawal", "NUMERIC(18,2)"), ("deposits", "NUMERIC(18,2)"), ("balance", "NUMERIC(18,2)")]:
-            has_col = await conn.fetchval(
-                "SELECT 1 FROM information_schema.columns WHERE table_name=$1 AND column_name=$2",
-                "master", col,
-            )
-            if not has_col:
-                qcol = f'"{col}"' if col == 'desc' else col
-                await conn.execute(f"ALTER TABLE master ADD COLUMN IF NOT EXISTS {qcol} {sql_type}")
+        # No statement columns are created here. Every field on master is a
+        # custom field the user adds through the Custom Fields page, so a fresh
+        # database starts as a bare id and an empty fieldmap. Existing
+        # databases are untouched — this only ever added missing columns.
         has_id = await conn.fetchval(
             "SELECT 1 FROM information_schema.columns WHERE table_name=$1 AND column_name=$2",
             "master", "id",
@@ -62,22 +58,6 @@ async def create_tables():
             await conn.execute(
                 "CREATE INDEX idx_fieldchange_log_changed_at ON fieldchange_log(changed_at DESC)"
             )
-
-
-async def insert_default_mappings():
-    defaults = [
-        ("date",        "Date",             "date,txn_date,value_date,transaction date,entry_date"),
-        ("desc",        "Description",      "description,narration,particulars,remarks,narrations"),
-        ("withdrawal",  "Withdrawal",       "withdrawal,debit,dr,amount_out"),
-        ("deposits",    "Deposits",         "deposits,credit,cr,amount_in,deposit"),
-        ("balance",     "Balance",          "balance,closing_balance,available_balance"),
-    ]
-    for fieldname, displayname, mapfields in defaults:
-        await Database.execute(
-            "INSERT INTO fieldmap (fieldname, displayname, mapfields) VALUES ($1, $2, $3) "
-            "ON CONFLICT (fieldname) DO NOTHING",
-            fieldname, displayname, mapfields,
-        )
 
 
 async def create_default_admin():

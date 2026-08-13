@@ -577,24 +577,57 @@ _FOOTER_KEYWORDS = {
 }
 
 
+_CATEGORY_VOCABULARY = {
+    "date":         ("date", "value_date", "entry_date", "tran_date", "txn_date"),
+    "description":  ("description", "desc", "particulars", "narration", "remarks", "narrations"),
+    "withdrawal":   ("withdrawal", "debit", "dr", "amount_out"),
+    "deposits":     ("deposits", "deposit", "credit", "cr", "amount_in", "deposit amt"),
+    "balance":      ("balance", "closing_balance", "available_balance"),
+    "reference_no": ("reference_no", "ref_no", "chq_ref_no", "cheque_no",
+                     "reference", "instrument_no", "ref"),
+}
+
+# Normalized once here, and the lookup normalizes its input the same way, so a
+# raw column name ("value_date") and a fieldmap alias as stored in alias_map
+# ("value date") both resolve — the two spellings can't drift apart.
+_CATEGORY_BY_TERM = {
+    _normalize_for_matching(term): cat
+    for cat, terms in _CATEGORY_VOCABULARY.items()
+    for term in terms
+}
+
+
 def _fieldname_category(fieldname: str) -> str | None:
     """Return the semantic category for a fieldname/alias, or None for custom fields.
     Categories are stable concept names — they don't depend on any specific fieldmap string.
     """
-    n = fieldname.lower().strip()
-    if n == "date" or n in ("value_date", "entry_date", "tran_date", "txn_date"):
-        return "date"
-    if n in ("description", "desc", "particulars", "narration", "remarks", "narrations"):
-        return "description"
-    if n in ("withdrawal", "debit", "dr", "amount_out"):
-        return "withdrawal"
-    if n in ("deposits", "deposit", "credit", "cr", "amount_in", "deposit amt"):
-        return "deposits"
-    if n in ("balance", "closing_balance", "available_balance"):
-        return "balance"
-    if n in ("reference_no", "ref_no", "chq_ref_no", "cheque_no", "reference", "instrument_no", "ref"):
-        return "reference_no"
-    return None  # custom field — passthrough
+    return _CATEGORY_BY_TERM.get(_normalize_for_matching(fieldname or ""))
+
+
+def _category_map_from_aliases(alias_map: dict) -> dict:
+    """{fieldname: category}, resolved through the fieldmap instead of the name.
+
+    A column's role comes from its own name when that name is already a concept
+    ("withdrawal"), and otherwise from any alias the user mapped onto it — so a
+    column called `field_num_5` whose mapfields contain "debit" IS the
+    withdrawal column. Nothing on master has to be named anything in particular,
+    which is what makes a fully user-defined schema parse at all.
+    """
+    cat_by_field = {}
+    for alias, fieldname in (alias_map or {}).items():
+        cat = _fieldname_category(fieldname) or _fieldname_category(alias)
+        if cat and fieldname not in cat_by_field:
+            cat_by_field[fieldname] = cat
+    return cat_by_field
+
+
+def _category_of(fieldname: str, cat_by_field: dict = None) -> str | None:
+    """Category of one column — fieldmap-resolved first, bare name as fallback."""
+    if cat_by_field:
+        cat = cat_by_field.get(fieldname)
+        if cat:
+            return cat
+    return _fieldname_category(fieldname)
 
 
 # Banks print long reference numbers inside a narrow narration column, so their
@@ -665,10 +698,8 @@ def _repair_over_split_rows(rows: list, alias_map: dict) -> list:
 
     # Resolve category → fieldname from fieldmap
     _cat = {}
-    for _, fn in (alias_map or {}).items():
-        cat = _fieldname_category(fn)
-        if cat and cat not in _cat:
-            _cat[cat] = fn
+    for fn, cat in _category_map_from_aliases(alias_map).items():
+        _cat.setdefault(cat, fn)
     bal_fn = _cat.get("balance", "balance")
     dep_fn = _cat.get("deposits", "deposits")
     wdr_fn = _cat.get("withdrawal", "withdrawal")
@@ -725,10 +756,8 @@ def _score_balance_chain(rows: list, alias_map: dict) -> tuple:
     Returns (consecutive_chain_length, complete_rows).
     """
     _cat = {}
-    for _, fn in (alias_map or {}).items():
-        cat = _fieldname_category(fn)
-        if cat and cat not in _cat:
-            _cat[cat] = fn
+    for fn, cat in _category_map_from_aliases(alias_map).items():
+        _cat.setdefault(cat, fn)
     bal_fn = _cat.get("balance", "balance")
     dep_fn = _cat.get("deposits", "deposits")
     wdr_fn = _cat.get("withdrawal", "withdrawal")
@@ -762,7 +791,8 @@ def _score_balance_chain(rows: list, alias_map: dict) -> tuple:
 
 
 def _assemble_rows(table_rows: list, header_idx: int, col_mapping: dict,
-                    live_col_types: dict = None, current_row=None) -> tuple:
+                    live_col_types: dict = None, current_row=None,
+                    cat_by_field: dict = None) -> tuple:
     """
     Assemble transaction rows from table data using fieldmap + column types.
 
@@ -800,7 +830,7 @@ def _assemble_rows(table_rows: list, header_idx: int, col_mapping: dict,
 
     for col_idx, fieldname in col_mapping.items():
         col_type = (live_col_types.get(fieldname) or "").lower()
-        cat = _fieldname_category(fieldname)
+        cat = _category_of(fieldname, cat_by_field)
         if col_type in ("date", "timestamp without time zone", "timestamp"):
             date_cols.append(col_idx)
         elif col_type in ("text", "character varying", "varchar"):
@@ -814,16 +844,16 @@ def _assemble_rows(table_rows: list, header_idx: int, col_mapping: dict,
     # Fallbacks when column types are unavailable: resolve roles by category
     if not date_cols:
         for col_idx, fieldname in col_mapping.items():
-            if _fieldname_category(fieldname) == "date":
+            if _category_of(fieldname, cat_by_field) == "date":
                 date_cols.append(col_idx)
     if balance_fieldname is None:
         for fieldname in col_mapping.values():
-            if _fieldname_category(fieldname) == "balance":
+            if _category_of(fieldname, cat_by_field) == "balance":
                 balance_fieldname = fieldname
                 break
     if not amount_fieldnames:
         for fieldname in col_mapping.values():
-            if _fieldname_category(fieldname) in ("withdrawal", "deposits"):
+            if _category_of(fieldname, cat_by_field) in ("withdrawal", "deposits"):
                 amount_fieldnames.append(fieldname)
     for dc in date_cols:
         if col_mapping.get(dc):
@@ -957,7 +987,8 @@ def _assemble_rows(table_rows: list, header_idx: int, col_mapping: dict,
 
 # ── Document-level fields ───────────────────────────────────────────────────
 
-def _extract_document_level_fields(text: str, fieldmap_rows: list, filled_fields: set) -> dict:
+def _extract_document_level_fields(text: str, fieldmap_rows: list, filled_fields: set,
+                                   cat_by_field: dict = None) -> dict:
     """
     Extract values printed OUTSIDE the transaction table — e.g. an account
     number in the statement header: "... your account number 045563200000264".
@@ -978,7 +1009,7 @@ def _extract_document_level_fields(text: str, fieldmap_rows: list, filled_fields
         fieldname = row.get("fieldname", "")
         if not fieldname or fieldname in filled_fields:
             continue
-        if _fieldname_category(fieldname) is not None:
+        if _category_of(fieldname, cat_by_field) is not None:
             continue
 
         aliases = set()
@@ -1079,6 +1110,8 @@ def _assemble_from_tables(tables: list, alias_map: dict, live_col_types: dict,
 
     Returns (rows, headers_detected, unmapped_headers).
     """
+    # Column roles come from the fieldmap, not from what the columns are named.
+    cat_by_field = _category_map_from_aliases(alias_map)
     all_rows = []
     headers_detected = {}
     unmapped_headers = []
@@ -1101,14 +1134,14 @@ def _assemble_from_tables(tables: list, alias_map: dict, live_col_types: dict,
                 if cell_str and col_idx not in col_mapping and cell_str not in unmapped_headers:
                     unmapped_headers.append(cell_str)
 
-            new_rows, current_row = _assemble_rows(table, header_idx, col_mapping, live_col_types, current_row)
+            new_rows, current_row = _assemble_rows(table, header_idx, col_mapping, live_col_types, current_row, cat_by_field)
             all_rows.extend(new_rows)
             last_mapping = col_mapping
             last_ncols = len(header_row)
         elif last_mapping and abs(table_len - last_ncols) <= 1:
             # Continuation page — tolerate ±1 column difference (pdfplumber often
             # detects one extra/missing column on continuation pages)
-            new_rows, current_row = _assemble_rows(table, -1, last_mapping, live_col_types, current_row)
+            new_rows, current_row = _assemble_rows(table, -1, last_mapping, live_col_types, current_row, cat_by_field)
             all_rows.extend(new_rows)
 
     # Flush the final open transaction
@@ -1160,6 +1193,9 @@ def parse_pdf(file_bytes: bytes, password: str = "", fieldmap_rows: list = None,
 
     # Build alias map from fieldmap (for header matching)
     alias_map = _build_alias_map(fieldmap_rows or [])
+    # …and the semantic role of each column, resolved through that same
+    # fieldmap so nothing depends on a column being *named* "withdrawal".
+    cat_by_field = _category_map_from_aliases(alias_map)
 
     # Live column types (passed from pdf_import, used for data-type-driven roles)
     live_col_types = live_col_types or {}
@@ -1231,10 +1267,8 @@ def parse_pdf(file_bytes: bytes, password: str = "", fieldmap_rows: list = None,
     # Table rows already have fieldmap fieldnames as keys — those pass through unchanged.
     # Build category→fieldname mapping from fieldmap's display names.
     _category_map = {}
-    for _, fieldname in (alias_map or {}).items():
-        cat = _fieldname_category(fieldname)
-        if cat and cat not in _category_map:
-            _category_map[cat] = fieldname
+    for fieldname, cat in cat_by_field.items():
+        _category_map.setdefault(cat, fieldname)
 
     canonical_to_master = {}
     for parser_key in ("date", "description", "withdrawal", "deposits", "balance", "reference_no"):
@@ -1275,7 +1309,7 @@ def parse_pdf(file_bytes: bytes, password: str = "", fieldmap_rows: list = None,
     desc_fields = {
         (fm.get("fieldname") or "")
         for fm in (fieldmap_rows or [])
-        if _fieldname_category(fm.get("fieldname") or "") == "description"
+        if _category_of(fm.get("fieldname") or "", cat_by_field) == "description"
     }
     for r in normalized:
         for fn in desc_fields:
@@ -1288,7 +1322,7 @@ def parse_pdf(file_bytes: bytes, password: str = "", fieldmap_rows: list = None,
     filled_keys = set()
     for r in normalized:
         filled_keys.update(r.keys())
-    doc_fields = _extract_document_level_fields(text, fieldmap_rows or [], filled_keys)
+    doc_fields = _extract_document_level_fields(text, fieldmap_rows or [], filled_keys, cat_by_field)
     if doc_fields:
         logger.info(f"[Parser] document-level fields: {doc_fields}")
         for r in normalized:
