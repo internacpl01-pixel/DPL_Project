@@ -987,6 +987,59 @@ def _assemble_rows(table_rows: list, header_idx: int, col_mapping: dict,
 
 # ── Document-level fields ───────────────────────────────────────────────────
 
+def _label_words(fieldmap_rows: list) -> set:
+    """Every word that appears in any field's label, from all three alias
+    sources. A captured value that starts with one of these is a neighbouring
+    LABEL, not a value — that is what stops "Account Number Account Type
+    Currency" from filling account_num with "Account Type", and stops the short
+    "Branch" alias from filling BRANCH with "Code" out of "Branch Code 1565"."""
+    words = set()
+    for row in (fieldmap_rows or []):
+        sources = (row.get("mapfields") or "").split(",")
+        sources += [row.get("displayname") or "", row.get("fieldname") or ""]
+        for src in sources:
+            for w in re.findall(r"[A-Za-z]+", src):
+                if len(w) > 1:
+                    words.add(w.lower())
+    return words
+
+
+def _is_label(val: str, label_words: set) -> bool:
+    """True when a captured value opens with a label word."""
+    toks = val.split()
+    if not toks:
+        return True
+    return re.sub(r"[^A-Za-z]", "", toks[0]).lower() in label_words
+
+
+def _trim_at_next_label(raw: str, label_words: set) -> str:
+    """Cut a to-end-of-line capture where the NEXT label starts.
+
+    Header cards put two label/value pairs on one line, so the capture runs
+    past its own value: "DWARKADHIS PROJECTS PRIVATE Product Code :632".
+    Two label shapes occur and both are cut here.
+    """
+    val = raw
+    # Colon-terminated label. Walk back over the words in front of the colon,
+    # stopping at the first ALL-CAPS one: these cards print values in caps and
+    # labels in mixed case, so "PRIVATE" and "NA" end the walk and stay in the
+    # value while "Product Code" and "Account Variant/ description" are removed.
+    m = re.search(r"[:=]", val)
+    if m:
+        toks = val[:m.start()].split()
+        cut = len(toks)
+        while cut > 0 and len(toks) - cut < 3 and not toks[cut - 1].isupper():
+            cut -= 1
+        val = " ".join(toks[:cut])
+    # Bare label built from fieldmap words — no colon to key on.
+    toks = val.split()
+    for i, tok in enumerate(toks):
+        if i and re.sub(r"[^A-Za-z]", "", tok).lower() in label_words:
+            toks = toks[:i]
+            break
+    return re.sub(r"\s+", " ", " ".join(toks)).strip(" \t,;:-–|")
+
+
 def _extract_document_level_fields(text: str, fieldmap_rows: list, filled_fields: set,
                                    cat_by_field: dict = None) -> dict:
     """
@@ -1005,6 +1058,8 @@ def _extract_document_level_fields(text: str, fieldmap_rows: list, filled_fields
     if not text:
         return doc_fields
 
+    label_words = _label_words(fieldmap_rows)
+
     for row in (fieldmap_rows or []):
         fieldname = row.get("fieldname", "")
         if not fieldname or fieldname in filled_fields:
@@ -1022,30 +1077,63 @@ def _extract_document_level_fields(text: str, fieldmap_rows: list, filled_fields
             if src:
                 aliases.add(src)
 
-        for alias in sorted(aliases, key=len, reverse=True):
-            if len(alias) < 3:
-                continue  # too short — would match random text
-            # The pattern is built from the alias AS WRITTEN and matched against
-            # the raw page text, so the two must agree on punctuation. Splitting
-            # into alphanumeric runs and rejoining with a flexible separator
-            # lets one alias match every way a bank prints the label:
-            # "A/c" also matches "A/C", "Ac", "A-c"; "num" also matches "number".
-            parts = [re.escape(p) for p in re.findall(r"[A-Za-z]+|\d+", alias)]
-            if not parts:
-                continue
-            parts[-1] += r"[a-z]*"
-            # The value must sit on the SAME line as its label. Allowing a
-            # newline here lets a table's column heading swallow the first cell
-            # of the row beneath it — re-importing our own export matched the
-            # "account_num" heading and captured the next row's date.
-            pattern = (r"\b" + r"[\s._/\-]*".join(parts)
-                       + r"[ \t:\-–=#]*([A-Za-z0-9][A-Za-z0-9/\-]*)")
-            # Keep scanning past a label that is followed by another label
-            # rather than a value ("Account Number Account Type Currency").
-            for m in re.finditer(pattern, text, re.IGNORECASE):
-                val = m.group(1).strip()
-                if len(val) >= 4 and any(ch.isdigit() for ch in val):
-                    doc_fields[fieldname] = val
+        # Two passes over the aliases. The strict pass is the original rule —
+        # one whitespace-free token containing a digit — and it runs to
+        # exhaustion first, so every field that resolves today resolves
+        # identically. Only a field it leaves empty reaches the word pass,
+        # which is what picks up a value like "DELHI PITAMPURA" that has no
+        # digit in it and does not fit in a single token.
+        for strict in (True, False):
+            for alias in sorted(aliases, key=len, reverse=True):
+                if len(alias) < 3:
+                    continue  # too short — would match random text
+                # The pattern is built from the alias AS WRITTEN and matched against
+                # the raw page text, so the two must agree on punctuation. Splitting
+                # into alphanumeric runs and rejoining with a flexible separator
+                # lets one alias match every way a bank prints the label:
+                # "A/c" also matches "A/C", "Ac", "A-c"; "num" also matches "number".
+                parts = [re.escape(p) for p in re.findall(r"[A-Za-z]+|\d+", alias)]
+                if not parts:
+                    continue
+                parts[-1] += r"[a-z]*"
+                # The value must sit on the SAME line as its label. Allowing a
+                # newline here lets a table's column heading swallow the first cell
+                # of the row beneath it — re-importing our own export matched the
+                # "account_num" heading and captured the next row's date.
+                head = r"\b(" + r"[\s._/\-]*".join(parts) + r")([ \t:\-–=#]*)"
+                tail = r"([A-Za-z0-9][A-Za-z0-9/\-]*)" if strict else r"([^\n]*)"
+                # Keep scanning past a label that is followed by another label
+                # rather than a value ("Account Number Account Type Currency").
+                for m in re.finditer(head + tail, text, re.IGNORECASE):
+                    if strict:
+                        val = m.group(3).strip()
+                        ok = len(val) >= 4 and any(ch.isdigit() for ch in val)
+                    else:
+                        # The word pass has no digit to vouch for the value, so
+                        # the LABEL has to be exact. The trailing "[a-z]*" that
+                        # lets "num" match "number" also lets the 3-char alias
+                        # "a/c" match the word "Account" — harmless while a
+                        # digit was required, but here it captured the rest of
+                        # "Account Relationship Summary as on 06-Aug-2026".
+                        if (_normalize_for_matching(m.group(1))
+                                != _normalize_for_matching(alias)):
+                            continue
+                        val = _trim_at_next_label(m.group(3), label_words)
+                        # A label printed with ":" or "=" is unambiguous — what
+                        # follows is its value even when it opens with a word
+                        # that appears in some other label ("Account status
+                        # :ACCOUNT OPEN REGULAR"). Only a label separated by
+                        # nothing but spaces needs the label-word guard, and
+                        # that is exactly the case the guard exists for
+                        # ("Account Number Account Type Currency").
+                        explicit = bool(re.search(r"[:=#]", m.group(2)))
+                        ok = (3 <= len(val) <= 80
+                              and re.match(r"^[A-Za-z0-9]", val)
+                              and (explicit or not _is_label(val, label_words)))
+                    if ok:
+                        doc_fields[fieldname] = val
+                        break
+                if fieldname in doc_fields:
                     break
             if fieldname in doc_fields:
                 break
